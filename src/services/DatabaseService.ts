@@ -1,4 +1,4 @@
-import * as SQLite from 'expo-sqlite';
+import * as SQLite from './EncryptedSQLite';
 import * as Crypto from 'expo-crypto';
 import * as SecureStore from 'expo-secure-store';
 
@@ -26,10 +26,12 @@ export interface ScanLog {
   user_id: number;
   user_name: string;
   area: string;
+  area_id?: number;
   access_granted: boolean;
   failure_reason?: string;
   scanned_at: string;
   scanner_user: string;
+  device_scan_id?: string;
 }
 
 class DatabaseServiceClass {
@@ -37,13 +39,58 @@ class DatabaseServiceClass {
 
   async initDatabase(): Promise<void> {
     try {
-      this.database = await SQLite.openDatabaseAsync('verigate_scan.db');
+      this.database = await this.openWithIntegrityCheck();
       await this.createTables();
       await this.createAndStoreEncryptedSeedData();
+      await this.recordIntegrityChecksum();
     } catch (error) {
       console.error('Database initialization error:', error);
       throw error;
     }
+  }
+
+  /** Opens the encrypted database, falling back to a fresh reset if the file
+   * is corrupted (Phase 6b rollback path) instead of crashing the app. */
+  private async openWithIntegrityCheck(): Promise<SQLite.SQLiteDatabase> {
+    try {
+      const db = await SQLite.openDatabaseAsync('verigate_scan.db');
+      await db.execAsync('SELECT 1');
+      return db;
+    } catch (error) {
+      console.warn('Encrypted database failed to open (corrupted?) - resetting local store:', error);
+      await SecureStore.deleteItemAsync('db_integrity_checksum');
+      await SecureStore.deleteItemAsync('scanner_seed_data_created');
+      return SQLite.openDatabaseAsync('verigate_scan.db');
+    }
+  }
+
+  private async recordIntegrityChecksum(): Promise<void> {
+    try {
+      const scanners = await this.getDemoScannerUsers();
+      const users = await this.getDemoRegularUsers();
+      const canonical = JSON.stringify({
+        scanners: scanners.map((s) => ({ ...s })).sort((a, b) => a.id - b.id),
+        users: users.map((u) => ({ ...u })).sort((a, b) => a.id - b.id),
+      });
+      const checksum = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonical);
+      const previous = await SecureStore.getItemAsync('db_integrity_checksum');
+      if (previous && previous !== checksum) {
+        console.warn('Local database checksum changed since last run (possible tampering or expected sync update)');
+      }
+      await SecureStore.setItemAsync('db_integrity_checksum', checksum);
+    } catch (error) {
+      console.warn('Could not record integrity checksum:', error);
+    }
+  }
+
+  /** Wipes synced event data once the event has ended (plus a grace period). */
+  async purgeIfEventExpired(eventEndsAtMs: number | null, gracePeriodMs = 24 * 60 * 60 * 1000): Promise<boolean> {
+    if (!eventEndsAtMs || Date.now() < eventEndsAtMs + gracePeriodMs) return false;
+    if (!this.database) return false;
+
+    await this.database.execAsync('DELETE FROM users; DELETE FROM synced_areas;');
+    await SecureStore.deleteItemAsync('db_integrity_checksum');
+    return true;
   }
 
   private async createTables(): Promise<void> {
@@ -76,17 +123,61 @@ class DatabaseServiceClass {
       );
     `);
 
-    // Scan logs table
+    // Scan logs table. device_scan_id is a client-generated UUID sent to the
+    // backend so retried uploads are de-duplicated server-side; `synced`
+    // tracks whether this row has been confirmed uploaded yet.
     await this.database.execAsync(`
       CREATE TABLE IF NOT EXISTS scan_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
         user_name TEXT NOT NULL,
         area TEXT NOT NULL,
+        area_id INTEGER,
         access_granted INTEGER NOT NULL,
         failure_reason TEXT,
         scanned_at TEXT NOT NULL,
-        scanner_user TEXT NOT NULL
+        scanner_user TEXT NOT NULL,
+        device_scan_id TEXT UNIQUE,
+        synced INTEGER DEFAULT 0
+      );
+    `);
+
+    // Areas pulled down from the backend for the currently selected event
+    // (replaces the hardcoded getAvailableAreas() list once synced).
+    await this.database.execAsync(`
+      CREATE TABLE IF NOT EXISTS synced_areas (
+        id INTEGER PRIMARY KEY,
+        event_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        requires_scan INTEGER DEFAULT 1
+      );
+    `);
+
+    // Locally queued incident reports / emergency overrides, uploaded to the
+    // backend when connectivity allows (offline-first).
+    await this.database.execAsync(`
+      CREATE TABLE IF NOT EXISTS incidents_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id INTEGER NOT NULL,
+        area TEXT,
+        category TEXT NOT NULL,
+        description TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        synced INTEGER DEFAULT 0
+      );
+    `);
+
+    await this.database.execAsync(`
+      CREATE TABLE IF NOT EXISTS overrides_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id INTEGER NOT NULL,
+        user_email TEXT,
+        area TEXT NOT NULL,
+        area_id INTEGER,
+        access_granted INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        synced INTEGER DEFAULT 0
       );
     `);
   }
@@ -352,18 +443,152 @@ class DatabaseServiceClass {
       throw new Error('Database not initialized');
     }
 
+    const deviceScanId = scanLog.device_scan_id ?? Crypto.randomUUID();
+
     await this.database.runAsync(
-      'INSERT INTO scan_logs (user_id, user_name, area, access_granted, failure_reason, scanned_at, scanner_user) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      `INSERT INTO scan_logs
+         (user_id, user_name, area, area_id, access_granted, failure_reason, scanned_at, scanner_user, device_scan_id, synced)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
       [
         scanLog.user_id,
         scanLog.user_name,
         scanLog.area,
+        scanLog.area_id ?? null,
         scanLog.access_granted ? 1 : 0,
         scanLog.failure_reason ?? null,
         scanLog.scanned_at,
-        scanLog.scanner_user
+        scanLog.scanner_user,
+        deviceScanId
       ]
     );
+  }
+
+  // --- Real backend sync (Phase 7) ---
+
+  async upsertSyncedUsers(users: User[]): Promise<void> {
+    if (!this.database) {
+      throw new Error('Database not initialized');
+    }
+    for (const user of users) {
+      await this.database.runAsync(
+        `INSERT INTO users (id, email, name, phone, access_level, allowed_areas, is_active)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           email = excluded.email,
+           name = excluded.name,
+           phone = excluded.phone,
+           access_level = excluded.access_level,
+           allowed_areas = excluded.allowed_areas,
+           is_active = excluded.is_active`,
+        [
+          user.id,
+          user.email,
+          user.name,
+          user.phone,
+          user.access_level,
+          JSON.stringify(user.allowed_areas),
+          user.is_active ? 1 : 0,
+        ]
+      );
+    }
+  }
+
+  async upsertSyncedAreas(eventId: number, areas: { id: number; name: string; requires_scan: boolean }[]): Promise<void> {
+    if (!this.database) {
+      throw new Error('Database not initialized');
+    }
+    await this.database.runAsync('DELETE FROM synced_areas WHERE event_id = ?', [eventId]);
+    for (const area of areas) {
+      await this.database.runAsync(
+        'INSERT OR REPLACE INTO synced_areas (id, event_id, name, requires_scan) VALUES (?, ?, ?, ?)',
+        [area.id, eventId, area.name, area.requires_scan ? 1 : 0]
+      );
+    }
+  }
+
+  async getSyncedAreas(eventId: number): Promise<{ id: number; name: string }[]> {
+    if (!this.database) {
+      throw new Error('Database not initialized');
+    }
+    const result = (await this.database.getAllAsync(
+      'SELECT id, name FROM synced_areas WHERE event_id = ? ORDER BY name',
+      [eventId]
+    )) as any[];
+    return result.map((row) => ({ id: row.id, name: row.name }));
+  }
+
+  async getUnsyncedScanLogs(limit = 25): Promise<(ScanLog & { id: number })[]> {
+    if (!this.database) {
+      throw new Error('Database not initialized');
+    }
+    const result = (await this.database.getAllAsync(
+      'SELECT * FROM scan_logs WHERE synced = 0 ORDER BY id ASC LIMIT ?',
+      [limit]
+    )) as any[];
+    return result.map((row) => ({
+      id: row.id,
+      user_id: row.user_id,
+      user_name: row.user_name,
+      area: row.area,
+      area_id: row.area_id,
+      access_granted: row.access_granted === 1,
+      failure_reason: row.failure_reason,
+      scanned_at: row.scanned_at,
+      scanner_user: row.scanner_user,
+      device_scan_id: row.device_scan_id,
+    }));
+  }
+
+  async markScanLogsSynced(ids: number[]): Promise<void> {
+    if (!this.database || ids.length === 0) return;
+    const placeholders = ids.map(() => '?').join(',');
+    await this.database.runAsync(`UPDATE scan_logs SET synced = 1 WHERE id IN (${placeholders})`, ids);
+  }
+
+  async queueIncident(eventId: number, category: string, description: string, area?: string): Promise<void> {
+    if (!this.database) throw new Error('Database not initialized');
+    await this.database.runAsync(
+      'INSERT INTO incidents_queue (event_id, area, category, description, created_at, synced) VALUES (?, ?, ?, ?, ?, 0)',
+      [eventId, area ?? null, category, description, new Date().toISOString()]
+    );
+  }
+
+  async getUnsyncedIncidents(): Promise<{ id: number; event_id: number; area: string | null; category: string; description: string }[]> {
+    if (!this.database) throw new Error('Database not initialized');
+    return (await this.database.getAllAsync('SELECT * FROM incidents_queue WHERE synced = 0 ORDER BY id ASC')) as any[];
+  }
+
+  async markIncidentsSynced(ids: number[]): Promise<void> {
+    if (!this.database || ids.length === 0) return;
+    const placeholders = ids.map(() => '?').join(',');
+    await this.database.runAsync(`UPDATE incidents_queue SET synced = 1 WHERE id IN (${placeholders})`, ids);
+  }
+
+  async queueOverride(
+    eventId: number,
+    area: string,
+    accessGranted: boolean,
+    reason: string,
+    userEmail?: string,
+    areaId?: number
+  ): Promise<void> {
+    if (!this.database) throw new Error('Database not initialized');
+    await this.database.runAsync(
+      'INSERT INTO overrides_queue (event_id, user_email, area, area_id, access_granted, reason, created_at, synced) VALUES (?, ?, ?, ?, ?, ?, ?, 0)',
+      [eventId, userEmail ?? null, area, areaId ?? null, accessGranted ? 1 : 0, reason, new Date().toISOString()]
+    );
+  }
+
+  async getUnsyncedOverrides(): Promise<{ id: number; event_id: number; user_email: string | null; area: string; area_id: number | null; access_granted: boolean; reason: string }[]> {
+    if (!this.database) throw new Error('Database not initialized');
+    const rows = (await this.database.getAllAsync('SELECT * FROM overrides_queue WHERE synced = 0 ORDER BY id ASC')) as any[];
+    return rows.map((row) => ({ ...row, access_granted: row.access_granted === 1 }));
+  }
+
+  async markOverridesSynced(ids: number[]): Promise<void> {
+    if (!this.database || ids.length === 0) return;
+    const placeholders = ids.map(() => '?').join(',');
+    await this.database.runAsync(`UPDATE overrides_queue SET synced = 1 WHERE id IN (${placeholders})`, ids);
   }
 
   async getScanLogs(limit: number = 50): Promise<ScanLog[]> {

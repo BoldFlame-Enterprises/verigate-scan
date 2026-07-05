@@ -1,0 +1,201 @@
+import * as SecureStore from 'expo-secure-store';
+import * as Application from 'expo-application';
+import { Platform } from 'react-native';
+import { ApiClient } from './ApiClient';
+import { DatabaseService, User } from './DatabaseService';
+import { SCAN_UPLOAD_BATCH_SIZE } from '../config';
+
+const CURRENT_EVENT_ID_KEY = 'verigate_scan_event_id';
+const CURRENT_EVENT_NAME_KEY = 'verigate_scan_event_name';
+const LAST_SYNC_AT_KEY = 'verigate_scan_last_sync_at';
+
+interface RemoteEvent {
+  id: number;
+  name: string;
+  ends_at: string | null;
+}
+
+interface SyncResult {
+  success: boolean;
+  eventId?: number;
+  eventName?: string;
+  userCount?: number;
+  areaCount?: number;
+  uploadedScans?: number;
+  error?: string;
+}
+
+/** Retries a flaky network call with exponential backoff (Phase 7 hardening). */
+async function withBackoff<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+  let lastError: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (i < attempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** i));
+      }
+    }
+  }
+  throw lastError;
+}
+
+class SyncServiceClass {
+  private deviceId: string | null = null;
+
+  private async getDeviceId(): Promise<string> {
+    if (this.deviceId) return this.deviceId;
+    this.deviceId =
+      Platform.OS === 'android'
+        ? (Application.getAndroidId() ?? `scan-${Date.now()}`)
+        : ((await Application.getIosIdForVendorAsync()) ?? `scan-${Date.now()}`);
+    return this.deviceId;
+  }
+
+  async getCurrentEventId(): Promise<number | null> {
+    const stored = await SecureStore.getItemAsync(CURRENT_EVENT_ID_KEY);
+    return stored ? Number(stored) : null;
+  }
+
+  async getCurrentEventName(): Promise<string | null> {
+    return SecureStore.getItemAsync(CURRENT_EVENT_NAME_KEY);
+  }
+
+  async getLastSyncAt(): Promise<number | null> {
+    const stored = await SecureStore.getItemAsync(LAST_SYNC_AT_KEY);
+    return stored ? Number(stored) : null;
+  }
+
+  /** Pulls users + areas for the event, uploads any queued scan logs /
+   * incidents / overrides, and reports a sync heartbeat. Fails open - the
+   * scanner keeps working offline against whatever was last synced. */
+  async syncNow(): Promise<SyncResult> {
+    try {
+      if (!ApiClient.isAuthenticated()) {
+        return { success: false, error: 'Not authenticated with backend' };
+      }
+
+      const events = await withBackoff(() => ApiClient.request<RemoteEvent[]>('/events'));
+      if (events.length === 0) {
+        return { success: false, error: 'No events assigned to this scanner account yet' };
+      }
+
+      let eventId = await this.getCurrentEventId();
+      const event = events.find((e) => e.id === eventId) ?? events[0];
+      eventId = event.id;
+
+      const [usersData, areasData] = await Promise.all([
+        withBackoff(() => ApiClient.request<{ users: User[] }>('/sync/users-database', { params: { event_id: eventId! } })),
+        withBackoff(() => ApiClient.request<{ areas: { id: number; name: string; requires_scan: boolean }[] }>('/sync/areas-database', { params: { event_id: eventId! } })),
+      ]);
+
+      await DatabaseService.upsertSyncedUsers(usersData.users);
+      await DatabaseService.upsertSyncedAreas(eventId, areasData.areas);
+
+      if (event.ends_at) {
+        await DatabaseService.purgeIfEventExpired(new Date(event.ends_at).getTime());
+      }
+
+      const uploadedScans = await this.uploadQueuedScans(eventId);
+      await this.uploadQueuedIncidents(eventId);
+      await this.uploadQueuedOverrides(eventId);
+
+      await SecureStore.setItemAsync(CURRENT_EVENT_ID_KEY, String(eventId));
+      await SecureStore.setItemAsync(CURRENT_EVENT_NAME_KEY, event.name);
+      await SecureStore.setItemAsync(LAST_SYNC_AT_KEY, String(Date.now()));
+
+      const deviceId = await this.getDeviceId();
+      await ApiClient.request('/notifications/sync-heartbeat', {
+        method: 'POST',
+        body: { device_id: deviceId, app: 'scan', event_id: eventId, platform: Platform.OS },
+      }).catch(() => undefined);
+
+      return {
+        success: true,
+        eventId,
+        eventName: event.name,
+        userCount: usersData.users.length,
+        areaCount: areasData.areas.length,
+        uploadedScans,
+      };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Sync failed' };
+    }
+  }
+
+  private async uploadQueuedScans(eventId: number): Promise<number> {
+    let totalUploaded = 0;
+    // Loop in batches so a very large offline backlog doesn't time out in one request.
+    for (;;) {
+      const pending = await DatabaseService.getUnsyncedScanLogs(SCAN_UPLOAD_BATCH_SIZE);
+      if (pending.length === 0) break;
+
+      const deviceId = await this.getDeviceId();
+      const logs = pending.map((log) => ({
+        user_id: log.user_id,
+        area_id: log.area_id,
+        access_granted: log.access_granted,
+        failure_reason: log.failure_reason,
+        scanned_at: log.scanned_at,
+        device_scan_id: log.device_scan_id,
+      }));
+
+      await withBackoff(() =>
+        ApiClient.request('/sync/scan-logs', {
+          method: 'POST',
+          body: { logs, device_id: deviceId, event_id: eventId },
+        })
+      );
+
+      await DatabaseService.markScanLogsSynced(pending.map((p) => p.id));
+      totalUploaded += pending.length;
+
+      if (pending.length < SCAN_UPLOAD_BATCH_SIZE) break;
+    }
+    return totalUploaded;
+  }
+
+  private async uploadQueuedIncidents(eventId: number): Promise<void> {
+    const pending = await DatabaseService.getUnsyncedIncidents();
+    const synced: number[] = [];
+    for (const incident of pending) {
+      try {
+        await ApiClient.request('/incidents', {
+          method: 'POST',
+          body: { event_id: eventId, category: incident.category, description: incident.description },
+        });
+        synced.push(incident.id);
+      } catch {
+        break; // stop on first failure, retry the rest next sync
+      }
+    }
+    await DatabaseService.markIncidentsSynced(synced);
+  }
+
+  private async uploadQueuedOverrides(eventId: number): Promise<void> {
+    const pending = await DatabaseService.getUnsyncedOverrides();
+    const synced: number[] = [];
+    for (const override of pending) {
+      if (!override.area_id) continue; // can't resolve the area id yet; retry next sync
+
+      try {
+        await ApiClient.request('/incidents/overrides', {
+          method: 'POST',
+          body: {
+            event_id: eventId,
+            area_id: override.area_id,
+            access_granted: override.access_granted,
+            reason: override.reason,
+          },
+        });
+        synced.push(override.id);
+      } catch {
+        break;
+      }
+    }
+    await DatabaseService.markOverridesSynced(synced);
+  }
+}
+
+export const SyncService = new SyncServiceClass();

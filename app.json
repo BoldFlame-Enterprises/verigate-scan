@@ -43,12 +43,24 @@
     },
     "plugins": [
       "expo-router",
-      "expo-sqlite",
       "expo-secure-store",
+      [
+        "@op-engineering/op-sqlite",
+        {
+          "sqlCipher": true
+        }
+      ],
       [
         "expo-camera",
         {
           "cameraPermission": "VeriGate Scan needs camera access to scan QR codes for access control verification."
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/images/icon.png",
+          "color": "#059669"
         }
       ]
     ],
@@ -59,7 +71,8 @@
       "router": {},
       "eas": {
         "projectId": "796443f2-a1cb-4300-a2b9-0632479d7796"
-      }
+      },
+      "apiBaseUrl": "http://localhost:3000/api"
     }
   }
 }

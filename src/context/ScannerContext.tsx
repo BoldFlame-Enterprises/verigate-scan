@@ -10,6 +10,8 @@ interface ScannerContextType {
   setScanCount: (count: number) => void;
   lastScanResult: ScanResult | null;
   setLastScanResult: (result: ScanResult | null) => void;
+  selectedArea: string | null;
+  setSelectedArea: (area: string | null) => void;
 }
 
 export interface ScanResult {
@@ -30,18 +32,21 @@ export const ScannerProvider: React.FC<ScannerProviderProps> = ({ children }) =>
   const [isScanning, setIsScanning] = useState<boolean>(true);
   const [scanCount, setScanCount] = useState<number>(0);
   const [lastScanResult, setLastScanResult] = useState<ScanResult | null>(null);
+  const [selectedArea, setSelectedArea] = useState<string | null>(null);
 
   return (
-    <ScannerContext.Provider 
-      value={{ 
-        scannerUser, 
-        setScannerUser, 
+    <ScannerContext.Provider
+      value={{
+        scannerUser,
+        setScannerUser,
         isScanning,
         setIsScanning,
         scanCount,
         setScanCount,
         lastScanResult,
-        setLastScanResult
+        setLastScanResult,
+        selectedArea,
+        setSelectedArea
       }}
     >
       {children}

@@ -14,9 +14,12 @@ import {
 import { router } from 'expo-router';
 import { useScanner } from '@/context/ScannerContext';
 import { DatabaseService, ScannerUser } from '@/services/DatabaseService';
+import { ApiClient } from '@/services/ApiClient';
+import { SyncService } from '@/services/SyncService';
 
 export default function LoginScreen() {
   const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [rememberMe, setRememberMe] = useState(false);
   const [demoUsers, setDemoUsers] = useState<ScannerUser[]>([]);
@@ -47,6 +50,8 @@ export default function LoginScreen() {
           setRememberMe(true);
         }
 
+        await ApiClient.loadTokens();
+
         console.log('✅ Loaded scanner data from encrypted database:', {
           scannerCount: users.length,
           userStats: stats
@@ -68,12 +73,26 @@ export default function LoginScreen() {
     setIsLoading(true);
 
     try {
-      const scannerUser = await DatabaseService.getScannerUserByEmail(email.toLowerCase().trim());
-      
+      const normalizedEmail = email.toLowerCase().trim();
+
+      // If a password was entered, authenticate against the real backend and
+      // pull this event's real users/areas down before falling back to the
+      // local demo data (keeps the scanner fully offline-first either way).
+      if (password) {
+        try {
+          await ApiClient.login(normalizedEmail, password);
+          await SyncService.syncNow();
+        } catch (backendError) {
+          console.warn('Backend login failed, falling back to local data:', backendError);
+        }
+      }
+
+      const scannerUser = await DatabaseService.getScannerUserByEmail(normalizedEmail);
+
       if (scannerUser) {
         // Store credentials if remember me is checked
-        await DatabaseService.storeScannerCredentials(email.toLowerCase().trim(), rememberMe);
-        
+        await DatabaseService.storeScannerCredentials(normalizedEmail, rememberMe);
+
         setScannerUser(scannerUser);
         router.replace('/(main)/scanner');
       } else {
@@ -128,6 +147,18 @@ export default function LoginScreen() {
               onChangeText={setEmail}
               placeholder="Enter your scanner email"
               keyboardType="email-address"
+              autoCapitalize="none"
+              autoCorrect={false}
+              editable={!isLoading}
+            />
+
+            <Text style={styles.label}>Password (optional, for live event sync)</Text>
+            <TextInput
+              style={styles.input}
+              value={password}
+              onChangeText={setPassword}
+              placeholder="Leave blank to use local demo data"
+              secureTextEntry
               autoCapitalize="none"
               autoCorrect={false}
               editable={!isLoading}

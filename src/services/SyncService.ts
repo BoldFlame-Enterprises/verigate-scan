@@ -163,7 +163,7 @@ class SyncServiceClass {
       try {
         await ApiClient.request('/incidents', {
           method: 'POST',
-          body: { event_id: eventId, category: incident.category, description: incident.description },
+          body: { event_id: eventId, category: incident.category, description: incident.description, area_id: incident.area_id ?? undefined },
         });
         synced.push(incident.id);
       } catch {
@@ -179,6 +179,15 @@ class SyncServiceClass {
     for (const override of pending) {
       if (!override.area_id) continue; // can't resolve the area id yet; retry next sync
 
+      // Resolve the attendee's email (captured at override time) to the
+      // backend's real numeric user id, so the override's accountability
+      // trail isn't silently dropped on sync.
+      let userId: number | undefined;
+      if (override.user_email) {
+        const user = await DatabaseService.getUserByEmail(override.user_email);
+        userId = user?.id;
+      }
+
       try {
         await ApiClient.request('/incidents/overrides', {
           method: 'POST',
@@ -187,6 +196,7 @@ class SyncServiceClass {
             area_id: override.area_id,
             access_granted: override.access_granted,
             reason: override.reason,
+            user_id: userId,
           },
         });
         synced.push(override.id);

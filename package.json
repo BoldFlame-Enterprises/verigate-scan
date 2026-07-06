@@ -20,6 +20,9 @@
   "jest": {
     "preset": "jest-expo"
   },
+  "op-sqlite": {
+    "sqlcipher": true
+  },
   "dependencies": {
     "@op-engineering/op-sqlite": "^9.2.7",
     "@react-native-picker/picker": "2.11.1",

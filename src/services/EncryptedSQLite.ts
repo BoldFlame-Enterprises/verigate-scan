@@ -19,8 +19,12 @@ import * as Crypto from 'expo-crypto';
  * DatabaseService.ts only needed to change its import, not every call site.
  */
 
+function keyNameFor(dbName: string): string {
+  return `sqlcipher_key_${dbName}`;
+}
+
 async function getOrCreateDeviceKey(dbName: string): Promise<string> {
-  const keyName = `sqlcipher_key_${dbName}`;
+  const keyName = keyNameFor(dbName);
   let key = await SecureStore.getItemAsync(keyName);
   if (!key) {
     const randomBytes = await Crypto.getRandomBytesAsync(32);
@@ -30,6 +34,28 @@ async function getOrCreateDeviceKey(dbName: string): Promise<string> {
     await SecureStore.setItemAsync(keyName, key);
   }
   return key;
+}
+
+/**
+ * Deletes the encrypted database file on disk and its stored key, so the
+ * next `openDatabaseAsync` call starts completely fresh with a new
+ * device key. Used as the real rollback path when the database fails to
+ * open or fails an integrity check (corruption/tampering).
+ */
+export async function resetDatabase(dbName: string): Promise<void> {
+  try {
+    // A wrong/mismatched key still yields a usable file handle for
+    // close()/delete() purposes - SQLCipher only fails to decrypt content on
+    // an actual query, not on opening the file descriptor.
+    const key = await getOrCreateDeviceKey(dbName);
+    const db = open({ name: dbName, encryptionKey: key });
+    db.close();
+    db.delete();
+  } catch (error) {
+    console.warn(`Could not cleanly delete corrupted database "${dbName}":`, error);
+  } finally {
+    await SecureStore.deleteItemAsync(keyNameFor(dbName));
+  }
 }
 
 export class SQLiteDatabase {

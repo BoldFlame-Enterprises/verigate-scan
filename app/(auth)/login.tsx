@@ -80,8 +80,18 @@ export default function LoginScreen() {
       // local demo data (keeps the scanner fully offline-first either way).
       if (password) {
         try {
-          await ApiClient.login(normalizedEmail, password);
-          await SyncService.syncNow();
+          const backendUser = await ApiClient.login(normalizedEmail, password);
+          const syncResult = await SyncService.syncNow();
+
+          // A real backend account with role 'scanner' or 'admin' can log
+          // into this app even if it isn't one of the 4 hardcoded demo
+          // scanners - grant it every area just synced for the event (real
+          // scanner/admin roles aren't restricted per-area the way the
+          // local demo model is).
+          if ((backendUser.role === 'scanner' || backendUser.role === 'admin') && syncResult.success && syncResult.eventId) {
+            const areas = await DatabaseService.getSyncedAreas(syncResult.eventId);
+            await DatabaseService.upsertSyncedScannerUser(backendUser, areas.map((a) => a.name));
+          }
         } catch (backendError) {
           console.warn('Backend login failed, falling back to local data:', backendError);
         }

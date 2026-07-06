@@ -41,6 +41,7 @@ class DatabaseServiceClass {
     try {
       this.database = await this.openWithIntegrityCheck();
       await this.createTables();
+      await this.verifyIntegrityAndRecoverIfTampered();
       await this.createAndStoreEncryptedSeedData();
       await this.recordIntegrityChecksum();
     } catch (error) {
@@ -49,34 +50,62 @@ class DatabaseServiceClass {
     }
   }
 
-  /** Opens the encrypted database, falling back to a fresh reset if the file
-   * is corrupted (Phase 6b rollback path) instead of crashing the app. */
+  /** Opens the encrypted database. If it fails to open or fails a cheap
+   * sanity query, the file is genuinely deleted and recreated from scratch
+   * with a fresh device key (Phase 6b rollback path), not just reopened
+   * against the same broken file. */
   private async openWithIntegrityCheck(): Promise<SQLite.SQLiteDatabase> {
     try {
       const db = await SQLite.openDatabaseAsync('verigate_scan.db');
       await db.execAsync('SELECT 1');
       return db;
     } catch (error) {
-      console.warn('Encrypted database failed to open (corrupted?) - resetting local store:', error);
+      console.warn('Encrypted database failed to open (corrupted?) - deleting and recreating:', error);
+      await SQLite.resetDatabase('verigate_scan.db');
       await SecureStore.deleteItemAsync('db_integrity_checksum');
       await SecureStore.deleteItemAsync('scanner_seed_data_created');
       return SQLite.openDatabaseAsync('verigate_scan.db');
     }
   }
 
+  /** Compares current data against the last-recorded checksum *before* this
+   * launch does any seeding/sync writes. A mismatch on a database that
+   * already had data and a prior checksum means the file was modified
+   * outside the app - reset rather than silently trust altered data. */
+  private async verifyIntegrityAndRecoverIfTampered(): Promise<void> {
+    try {
+      const previous = await SecureStore.getItemAsync('db_integrity_checksum');
+      if (!previous) return; // first run, nothing to compare against yet
+
+      const current = await this.computeIntegrityChecksum();
+      if (current === previous) return;
+
+      const existingScanners = await this.getDemoScannerUsers();
+      const existingUsers = await this.getDemoRegularUsers();
+      if (existingScanners.length === 0 && existingUsers.length === 0) return; // nothing to have been tampered with
+
+      console.warn('Local database integrity check failed (unexpected external change) - resetting to a clean state');
+      await this.database?.execAsync('DELETE FROM users; DELETE FROM scanner_users; DELETE FROM synced_areas;');
+      await SecureStore.deleteItemAsync('scanner_seed_data_created');
+      await SecureStore.deleteItemAsync('db_integrity_checksum');
+    } catch (error) {
+      console.warn('Integrity verification failed to run:', error);
+    }
+  }
+
+  private async computeIntegrityChecksum(): Promise<string> {
+    const scanners = await this.getDemoScannerUsers();
+    const users = await this.getDemoRegularUsers();
+    const canonical = JSON.stringify({
+      scanners: scanners.map((s) => ({ ...s })).sort((a, b) => a.id - b.id),
+      users: users.map((u) => ({ ...u })).sort((a, b) => a.id - b.id),
+    });
+    return Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonical);
+  }
+
   private async recordIntegrityChecksum(): Promise<void> {
     try {
-      const scanners = await this.getDemoScannerUsers();
-      const users = await this.getDemoRegularUsers();
-      const canonical = JSON.stringify({
-        scanners: scanners.map((s) => ({ ...s })).sort((a, b) => a.id - b.id),
-        users: users.map((u) => ({ ...u })).sort((a, b) => a.id - b.id),
-      });
-      const checksum = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonical);
-      const previous = await SecureStore.getItemAsync('db_integrity_checksum');
-      if (previous && previous !== checksum) {
-        console.warn('Local database checksum changed since last run (possible tampering or expected sync update)');
-      }
+      const checksum = await this.computeIntegrityChecksum();
       await SecureStore.setItemAsync('db_integrity_checksum', checksum);
     } catch (error) {
       console.warn('Could not record integrity checksum:', error);
@@ -89,7 +118,7 @@ class DatabaseServiceClass {
     if (!this.database) return false;
 
     await this.database.execAsync('DELETE FROM users; DELETE FROM synced_areas;');
-    await SecureStore.deleteItemAsync('db_integrity_checksum');
+    await this.recordIntegrityChecksum();
     return true;
   }
 
@@ -160,6 +189,7 @@ class DatabaseServiceClass {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_id INTEGER NOT NULL,
         area TEXT,
+        area_id INTEGER,
         category TEXT NOT NULL,
         description TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -470,6 +500,11 @@ class DatabaseServiceClass {
       throw new Error('Database not initialized');
     }
     for (const user of users) {
+      // A local demo-seeded row can hold this same email under a different
+      // (locally-generated) id. Since email is UNIQUE, upserting by id alone
+      // would violate that constraint in that case - clear the stale row first.
+      await this.database.runAsync(`DELETE FROM users WHERE email = ? AND id != ?`, [user.email, user.id]);
+
       await this.database.runAsync(
         `INSERT INTO users (id, email, name, phone, access_level, allowed_areas, is_active)
          VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -491,6 +526,40 @@ class DatabaseServiceClass {
         ]
       );
     }
+
+    // Sync is a legitimate data change - re-baseline the integrity checksum
+    // so the next launch doesn't mistake this update for external tampering.
+    await this.recordIntegrityChecksum();
+  }
+
+  /**
+   * Upserts a real backend account (role 'scanner' or 'admin') into the
+   * local scanner_users table by its real numeric id, so a genuine operator
+   * account - not just the four hardcoded demo scanners - can log into this
+   * app. Real backend scanner/admin roles aren't restricted to specific
+   * areas the way the local demo model implies, so they're granted every
+   * area currently synced for the event.
+   */
+  async upsertSyncedScannerUser(scanner: { id: number; email: string; name: string; role: string }, allowedAreas: string[]): Promise<void> {
+    if (!this.database) {
+      throw new Error('Database not initialized');
+    }
+
+    await this.database.runAsync(`DELETE FROM scanner_users WHERE email = ? AND id != ?`, [scanner.email, scanner.id]);
+
+    await this.database.runAsync(
+      `INSERT INTO scanner_users (id, email, name, role, allowed_areas, is_active)
+       VALUES (?, ?, ?, ?, ?, 1)
+       ON CONFLICT(id) DO UPDATE SET
+         email = excluded.email,
+         name = excluded.name,
+         role = excluded.role,
+         allowed_areas = excluded.allowed_areas,
+         is_active = 1`,
+      [scanner.id, scanner.email, scanner.name, scanner.role, JSON.stringify(allowedAreas)]
+    );
+
+    await this.recordIntegrityChecksum();
   }
 
   async upsertSyncedAreas(eventId: number, areas: { id: number; name: string; requires_scan: boolean }[]): Promise<void> {
@@ -545,15 +614,15 @@ class DatabaseServiceClass {
     await this.database.runAsync(`UPDATE scan_logs SET synced = 1 WHERE id IN (${placeholders})`, ids);
   }
 
-  async queueIncident(eventId: number, category: string, description: string, area?: string): Promise<void> {
+  async queueIncident(eventId: number, category: string, description: string, area?: string, areaId?: number): Promise<void> {
     if (!this.database) throw new Error('Database not initialized');
     await this.database.runAsync(
-      'INSERT INTO incidents_queue (event_id, area, category, description, created_at, synced) VALUES (?, ?, ?, ?, ?, 0)',
-      [eventId, area ?? null, category, description, new Date().toISOString()]
+      'INSERT INTO incidents_queue (event_id, area, area_id, category, description, created_at, synced) VALUES (?, ?, ?, ?, ?, ?, 0)',
+      [eventId, area ?? null, areaId ?? null, category, description, new Date().toISOString()]
     );
   }
 
-  async getUnsyncedIncidents(): Promise<{ id: number; event_id: number; area: string | null; category: string; description: string }[]> {
+  async getUnsyncedIncidents(): Promise<{ id: number; event_id: number; area: string | null; area_id: number | null; category: string; description: string }[]> {
     if (!this.database) throw new Error('Database not initialized');
     return (await this.database.getAllAsync('SELECT * FROM incidents_queue WHERE synced = 0 ORDER BY id ASC')) as any[];
   }

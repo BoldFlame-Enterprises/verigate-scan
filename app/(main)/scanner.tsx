@@ -568,7 +568,10 @@ function IncidentModal({
       return;
     }
 
-    await DatabaseService.queueIncident(eventId, category, description.trim(), area);
+    const areas = await DatabaseService.getSyncedAreas(eventId);
+    const resolvedAreaId = area ? areas.find((a) => a.name === area)?.id : undefined;
+
+    await DatabaseService.queueIncident(eventId, category, description.trim(), area, resolvedAreaId);
     Alert.alert('Incident reported', 'This will be uploaded and visible to admins on the next sync.');
     setDescription('');
     onClose();

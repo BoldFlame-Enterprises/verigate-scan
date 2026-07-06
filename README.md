@@ -25,7 +25,7 @@ This is an **Expo (SDK 53) app**, not a bare React Native CLI project, and it us
 
 ## 🔒 Local database encryption
 
-Same mechanism as the pass app: the local database is a real SQLCipher-encrypted file (`@op-engineering/op-sqlite`), keyed by a random 256-bit value generated on first run and held only in the platform secure keystore via `expo-secure-store`. Every app start verifies a SHA-256 checksum of the database contents and safely resets/re-seeds on corruption instead of crashing; synced event data is purged automatically once an event ends (plus a 24h grace period).
+Same mechanism as the pass app: the local database is a real SQLCipher-encrypted file (`@op-engineering/op-sqlite`), enabled via a `"op-sqlite": { "sqlcipher": true }` key in `package.json` (op-sqlite has no Expo config plugin - this is read directly by its own build scripts), keyed by a random 256-bit value generated on first run and held only in the platform secure keystore via `expo-secure-store`. Every app start verifies a SHA-256 checksum of the database contents; on corruption or tampering the database is genuinely deleted and recreated with a fresh key rather than reopening the same broken file. Synced event data is purged automatically once an event ends (plus a 24h grace period).
 
 Because `op-sqlite` is a native module, **this app cannot run in Expo Go** - it requires a custom dev client or a full prebuild:
 

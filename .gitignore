@@ -159,11 +159,9 @@ ios/Pods/MMKV
 /android/app/build/
 /ios/build/
 
-# Package managers - use workspace management
-package-lock.json
+# Alternative package managers
 yarn.lock
 pnpm-lock.yaml
-**/package-lock.json
 **/yarn.lock
 
 # Yarn workspace files (if any)

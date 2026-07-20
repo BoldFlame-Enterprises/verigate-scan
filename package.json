@@ -8,7 +8,9 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "lint": "expo lint",
-    "test": "jest --watchAll",
+    "type-check": "tsc --noEmit",
+    "test": "jest --runInBand",
+    "doctor": "expo-doctor",
     "build:android": "eas build --platform android",
     "build:ios": "eas build --platform ios",
     "build:local:android": "eas build --platform android --local",
@@ -41,7 +43,7 @@
     "expo-system-ui": "~5.0.9",
     "react": "19.0.0",
     "react-dom": "19.0.0",
-    "react-native": "0.79.5",
+    "react-native": "0.79.6",
     "react-native-safe-area-context": "5.4.0",
     "react-native-screens": "~4.11.1",
     "react-native-svg": "15.11.2"
@@ -55,9 +57,24 @@
     "eslint": "^9.30.0",
     "eslint-config-expo": "~9.2.0",
     "eslint-plugin-react-hooks": "^5.2.0",
+    "expo-doctor": "1.20.1",
     "jest": "~29.7.0",
     "jest-expo": "~53.0.8",
     "typescript": "~5.8.3"
   },
-  "private": true
+  "private": true,
+  "engines": {
+    "node": ">=22.14.0 <23",
+    "npm": "10.9.2"
+  },
+  "packageManager": "npm@10.9.2",
+  "expo": {
+    "doctor": {
+      "reactNativeDirectoryCheck": {
+        "exclude": [
+          "expo-av"
+        ]
+      }
+    }
+  }
 }

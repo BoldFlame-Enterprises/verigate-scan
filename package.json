@@ -51,6 +51,7 @@
   },
   "devDependencies": {
     "@babel/core": "^7.27.7",
+    "@types/jest": "^29.5.14",
     "@types/react": "~19.0.14",
     "@typescript-eslint/eslint-plugin": "^8.35.0",
     "@typescript-eslint/parser": "^8.35.0",

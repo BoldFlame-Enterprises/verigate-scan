@@ -11,7 +11,9 @@ The mobile app scanners/staff use to verify attendee QR codes offline against a 
 - **Emergency / manual override**: security/admin-role scanners can grant or deny access outside the normal QR flow with a mandatory logged reason, synced to the backend and reviewable on the dashboard.
 - **Incident reporting**: flag suspicious activity or technical issues from the scan screen; synced to the backend's incident queue.
 - **Multi-user, role-aware UI**: multiple scanner accounts can log in/out on one device (quick-login list); security/admin roles see an extra "Emergency Override" action volunteers don't.
-- **Live event sync**: logging in with a password authenticates against the backend and pulls this event's real users + areas down, uploads queued scan logs/incidents/overrides with retry + backoff, and reports a sync heartbeat the dashboard's real-time monitor reads. Leaving the password blank keeps the app fully offline on local demo data.
+- **Live event sync**: production login authenticates against the backend, retains complete per-area assignments and the trusted event QR authority, and uploads each queue under its immutable originating event. Blank-password local data is available only when `EXPO_PUBLIC_DEMO_MODE=true`.
+
+- **Queue acknowledgements**: scans, incidents, and overrides keep client record IDs and occurrence times; only accepted or known-duplicate records are removed locally.
 - **Sync-stale local warning**: a local notification (`expo-notifications`) fires if the device hasn't synced recently - there is no remote push in this app by design (scanners are expected to be actively at the device).
 
 ## 🛠️ Tech Stack (as actually built)

@@ -38,7 +38,7 @@ interface RecordAckResponse {
   status: 'accepted' | 'duplicate';
 }
 
-/** Retries a flaky network call with exponential backoff (Phase 7 hardening). */
+/** Retries a flaky network call with exponential backoff for resilience. */
 async function withBackoff<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
   let lastError: unknown;
   for (let i = 0; i < attempts; i++) {

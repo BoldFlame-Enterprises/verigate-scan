@@ -3,7 +3,7 @@ import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
 
 /**
- * Genuine at-rest encryption for the local SQLite database (Phase 6b),
+ * Genuine at-rest encryption for the local SQLite database,
  * replacing the plaintext expo-sqlite file with an op-sqlite database opened
  * under SQLCipher, keyed by a random 256-bit key generated on first run and
  * stored in the platform secure keystore (iOS Keychain / Android Keystore

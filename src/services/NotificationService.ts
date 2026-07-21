@@ -15,7 +15,7 @@ Notifications.setNotificationHandler({
 const SYNC_STALE_NOTIFICATION_ID = 'sync-stale-warning';
 
 /**
- * Local-only notifications for the scanner app (Phase 5a) - there is no
+ * Local-only notifications for the scanner app - there is no
  * remote push here by design; scanners are expected to be actively working
  * the device, so the useful signal is "you're operating on stale data,"
  * scheduled fresh after every successful sync.

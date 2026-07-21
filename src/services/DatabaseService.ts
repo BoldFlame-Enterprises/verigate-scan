@@ -82,7 +82,7 @@ class DatabaseServiceClass {
 
   /** Opens the encrypted database. If it fails to open or fails a cheap
    * sanity query, the file is genuinely deleted and recreated from scratch
-   * with a fresh device key (Phase 6b rollback path), not just reopened
+   * with a fresh device key during secure-storage recovery, not just reopened
    * against the same broken file. */
   private async openWithIntegrityCheck(): Promise<SQLite.SQLiteDatabase> {
     try {
@@ -573,7 +573,7 @@ class DatabaseServiceClass {
     );
   }
 
-  // --- Real backend sync (Phase 7) ---
+  // --- Backend synchronization ---
 
   async upsertSyncedUsers(eventId: number, users: User[]): Promise<void> {
     if (!this.database) {

@@ -46,7 +46,8 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "VeriGate Scan needs camera access to scan QR codes for access control verification."
+          "cameraPermission": "VeriGate Scan needs camera access to scan QR codes for access control verification.",
+          "recordAudioAndroid": false
         }
       ],
       [

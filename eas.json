@@ -13,6 +13,7 @@
         "withoutCredentials": false,
         "env": {
           "GRADLE_OPTS": "-Xmx2048m -XX:MaxMetaspaceSize=512m",
+          "EXPO_PUBLIC_API_URL": "https://verigate-api-flle.onrender.com/api",
           "EXPO_PUBLIC_DEMO_MODE": "false"
         }
       }
@@ -25,6 +26,7 @@
         "withoutCredentials": false,
         "env": {
           "GRADLE_OPTS": "-Xmx2048m -XX:MaxMetaspaceSize=512m",
+          "EXPO_PUBLIC_API_URL": "https://verigate-api-flle.onrender.com/api",
           "EXPO_PUBLIC_DEMO_MODE": "false"
         }
       }
@@ -36,6 +38,7 @@
         "gradleCommand": ":app:assembleRelease",
         "env": {
           "GRADLE_OPTS": "-Xmx2048m -XX:MaxMetaspaceSize=512m",
+          "EXPO_PUBLIC_API_URL": "https://verigate-api-flle.onrender.com/api",
           "EXPO_PUBLIC_DEMO_MODE": "false"
         }
       }

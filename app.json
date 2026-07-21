@@ -62,11 +62,11 @@
     },
     "extra": {
       "router": {},
-      "eas": {
-        "projectId": "796443f2-a1cb-4300-a2b9-0632479d7796"
-      },
       "apiBaseUrl": "http://localhost:3000/api",
-      "demoMode": false
+      "demoMode": false,
+      "eas": {
+        "projectId": "f87b2c52-b3c6-4af0-8c83-21756a665b87"
+      }
     }
   }
 }

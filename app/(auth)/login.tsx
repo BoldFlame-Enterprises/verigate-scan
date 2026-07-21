@@ -16,6 +16,8 @@ import { useScanner } from '@/context/ScannerContext';
 import { DatabaseService, ScannerUser } from '@/services/DatabaseService';
 import { ApiClient } from '@/services/ApiClient';
 import { SyncService } from '@/services/SyncService';
+import { OfflineSessionService } from '@/services/OfflineSessionService';
+import { DEMO_MODE } from '@/config';
 
 export default function LoginScreen() {
   const [email, setEmail] = useState('');
@@ -35,12 +37,10 @@ export default function LoginScreen() {
     // Load demo users and stats dynamically from encrypted database
     const loadInitialData = async () => {
       try {
-        // Load scanner users from encrypted database
-        const users = await DatabaseService.getDemoScannerUsers();
+        const users = DEMO_MODE ? await DatabaseService.getDemoScannerUsers() : [];
         setDemoUsers(users);
 
-        // Load statistics to prove data is from database
-        const stats = await DatabaseService.getUserStatistics();
+        const stats = DEMO_MODE ? await DatabaseService.getUserStatistics() : null;
         setDataStats(stats);
 
         // Load stored email from secure storage
@@ -75,26 +75,30 @@ export default function LoginScreen() {
     try {
       const normalizedEmail = email.toLowerCase().trim();
 
-      // If a password was entered, authenticate against the real backend and
-      // pull this event's real users/areas down before falling back to the
-      // local demo data (keeps the scanner fully offline-first either way).
-      if (password) {
-        try {
-          const backendUser = await ApiClient.login(normalizedEmail, password);
-          const syncResult = await SyncService.syncNow();
+      if (!password && !DEMO_MODE) {
+        Alert.alert('Password required', 'Production scanner login requires backend authentication.');
+        return;
+      }
 
-          // A real backend account with role 'scanner' or 'admin' can log
-          // into this app even if it isn't one of the 4 hardcoded demo
-          // scanners - grant it every area just synced for the event (real
-          // scanner/admin roles aren't restricted per-area the way the
-          // local demo model is).
-          if ((backendUser.role === 'scanner' || backendUser.role === 'admin') && syncResult.success && syncResult.eventId) {
-            const areas = await DatabaseService.getSyncedAreas(syncResult.eventId);
-            await DatabaseService.upsertSyncedScannerUser(backendUser, areas.map((a) => a.name));
-          }
-        } catch (backendError) {
-          console.warn('Backend login failed, falling back to local data:', backendError);
+      let eventId = 0;
+      let mode: 'production' | 'demo' = 'demo';
+      if (password) {
+        const backendUser = await ApiClient.login(normalizedEmail, password);
+        if (backendUser.role !== 'scanner' && backendUser.role !== 'admin') {
+          await ApiClient.clearTokens();
+          throw new Error('This account is not authorized to use VeriGate Scan');
         }
+        const syncResult = await SyncService.syncNow();
+        if (!syncResult.success || !syncResult.eventId) {
+          await ApiClient.clearTokens();
+          throw new Error(syncResult.error ?? 'Initial event sync failed');
+        }
+        eventId = syncResult.eventId;
+        mode = 'production';
+        const areas = await DatabaseService.getSyncedAreas(eventId);
+        await DatabaseService.upsertSyncedScannerUser(backendUser, areas.map((area) => area.name));
+      } else {
+        await ApiClient.clearTokens();
       }
 
       const scannerUser = await DatabaseService.getScannerUserByEmail(normalizedEmail);
@@ -102,17 +106,19 @@ export default function LoginScreen() {
       if (scannerUser) {
         // Store credentials if remember me is checked
         await DatabaseService.storeScannerCredentials(normalizedEmail, rememberMe);
-
+        await OfflineSessionService.create(scannerUser.id, normalizedEmail, eventId, mode);
         setScannerUser(scannerUser);
         router.replace('/(main)/scanner');
       } else {
         Alert.alert(
           'Login Failed', 
-          'Scanner account not found. Please check your email address.\n\nDemo scanner accounts:\n• scanner1@event.com\n• scanner2@event.com\n• security@event.com\n• admin@event.com'
+          DEMO_MODE
+            ? 'Scanner account not found. Check the email or select a listed demo account.'
+            : 'Scanner account not found after backend authentication and event sync.'
         );
       }
     } catch (error) {
-      Alert.alert('Error', 'Login failed. Please try again.');
+      Alert.alert('Login failed', error instanceof Error ? error.message : 'Login failed. Please try again.');
       console.error('Login error:', error);
     } finally {
       setIsLoading(false);
@@ -162,12 +168,12 @@ export default function LoginScreen() {
               editable={!isLoading}
             />
 
-            <Text style={styles.label}>Password (optional, for live event sync)</Text>
+            <Text style={styles.label}>{DEMO_MODE ? 'Password (blank only for demo accounts)' : 'Password'}</Text>
             <TextInput
               style={styles.input}
               value={password}
               onChangeText={setPassword}
-              placeholder="Leave blank to use local demo data"
+              placeholder={DEMO_MODE ? 'Blank selects explicit demo mode' : 'Enter your backend password'}
               secureTextEntry
               autoCapitalize="none"
               autoCorrect={false}
@@ -194,12 +200,12 @@ export default function LoginScreen() {
               </Text>
             </TouchableOpacity>
 
-            <TouchableOpacity
+            {DEMO_MODE && <TouchableOpacity
               style={styles.demoButton}
               onPress={showDemoAccounts}
             >
               <Text style={styles.demoButtonText}>View Demo Accounts</Text>
-            </TouchableOpacity>
+            </TouchableOpacity>}
           </View>
 
           {demoUsers.length > 0 && (

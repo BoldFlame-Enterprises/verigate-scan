@@ -18,13 +18,15 @@ import { DatabaseService } from '../../src/services/DatabaseService';
 import { SyncService } from '../../src/services/SyncService';
 import { NotificationService } from '../../src/services/NotificationService';
 import { AudioFeedbackService } from '../../src/services/AudioFeedbackService';
+import { ApiClient } from '../../src/services/ApiClient';
+import { OfflineSessionService } from '../../src/services/OfflineSessionService';
 
 const { width } = Dimensions.get('window');
 
 type Modal_ = 'none' | 'manual' | 'override' | 'incident' | 'area';
 
 export default function ScannerScreen() {
-  const { scannerUser, lastScanResult, setLastScanResult, selectedArea, setSelectedArea } = useScanner();
+  const { scannerUser, setScannerUser, lastScanResult, setLastScanResult, selectedArea, setSelectedArea } = useScanner();
   const [isScanning, setIsScanning] = useState(true);
   const [scanCount, setScanCount] = useState(0);
   const [permission, requestPermission] = useCameraPermissions();
@@ -46,11 +48,12 @@ export default function ScannerScreen() {
 
   useEffect(() => {
     (async () => {
-      const id = await SyncService.getCurrentEventId();
+      const session = await OfflineSessionService.getValid(scannerUser?.email);
+      const id = (await SyncService.getCurrentEventId()) ?? session?.eventId ?? null;
       setEventId(id);
       setLastSyncAt(await SyncService.getLastSyncAt());
 
-      const areas = id ? await DatabaseService.getSyncedAreas(id) : [];
+      const areas = id != null ? await DatabaseService.getSyncedAreas(id) : [];
       const areaNames = areas.length > 0 ? areas.map((a) => a.name) : scannerUser?.allowed_areas ?? [];
       setAvailableAreas(areaNames.filter((name) => !scannerUser || scannerUser.allowed_areas.includes(name)));
 
@@ -84,17 +87,24 @@ export default function ScannerScreen() {
       Alert.alert('Error', 'No scanning area selected.');
       return;
     }
+    if (eventId == null) {
+      Alert.alert('Error', 'No bounded event session is available. Sign in and sync first.');
+      return;
+    }
 
     setIsScanning(false);
 
     try {
-      const verification = await DatabaseService.verifyQRCode(data, scanArea);
+      const verification = await DatabaseService.verifyQRCode(data, scanArea, eventId);
 
       if (verification.user) {
+        const areas = await DatabaseService.getSyncedAreas(eventId);
         await DatabaseService.logScan({
+          event_id: eventId,
           user_id: verification.user.id,
           user_name: verification.user.name,
           area: scanArea,
+          area_id: areas.find((area) => area.name === scanArea)?.id,
           access_granted: verification.success,
           failure_reason: verification.success ? undefined : verification.reason,
           scanned_at: new Date().toISOString(),
@@ -138,7 +148,7 @@ export default function ScannerScreen() {
         setIsScanning(true);
       }, 2000);
     }
-  }, [isScanning, scannerUser, selectedArea, setLastScanResult]);
+  }, [eventId, isScanning, scannerUser, selectedArea, setLastScanResult]);
 
   const handleLogout = () => {
     Alert.alert(
@@ -151,6 +161,9 @@ export default function ScannerScreen() {
           style: 'destructive',
           onPress: async () => {
             await DatabaseService.clearScannerCredentials();
+            await OfflineSessionService.clear();
+            await ApiClient.clearTokens();
+            setScannerUser(null);
             router.replace('/(auth)/login');
           },
         },
@@ -335,6 +348,7 @@ export default function ScannerScreen() {
         visible={activeModal === 'manual'}
         area={selectedArea ?? scannerUser?.allowed_areas[0] ?? ''}
         scannerName={scannerUser?.name ?? 'Unknown'}
+        eventId={eventId}
         onClose={() => setActiveModal('none')}
         onResult={(result) => {
           setActiveModal('none');
@@ -397,12 +411,14 @@ function ManualEntryModal({
   visible,
   area,
   scannerName,
+  eventId,
   onClose,
   onResult,
 }: {
   visible: boolean;
   area: string;
   scannerName: string;
+  eventId: number | null;
   onClose: () => void;
   onResult: (result: { success: boolean; message: string; userName?: string; timestamp: Date }) => void;
 }) {
@@ -414,7 +430,11 @@ function ManualEntryModal({
       return;
     }
 
-    const user = await DatabaseService.getUserByEmail(email.toLowerCase().trim());
+    if (eventId == null) {
+      onResult({ success: false, message: 'No bounded event session is available', timestamp: new Date() });
+      return;
+    }
+    const user = await DatabaseService.getUserByEmail(email.toLowerCase().trim(), eventId);
     if (!user) {
       onResult({ success: false, message: 'No matching attendee found for manual entry', timestamp: new Date() });
       setEmail('');
@@ -422,10 +442,13 @@ function ManualEntryModal({
     }
 
     const granted = user.allowed_areas.includes(area);
+    const areas = await DatabaseService.getSyncedAreas(eventId);
     await DatabaseService.logScan({
+      event_id: eventId,
       user_id: user.id,
       user_name: user.name,
       area,
+      area_id: areas.find((item) => item.name === area)?.id,
       access_granted: granted,
       failure_reason: granted ? undefined : `No access to ${area} (manual entry)`,
       scanned_at: new Date().toISOString(),

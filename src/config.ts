@@ -5,5 +5,9 @@ export const API_BASE_URL: string =
   (Constants.expoConfig?.extra?.apiBaseUrl as string | undefined) ||
   'http://localhost:3000/api';
 
+export const DEMO_MODE: boolean =
+  process.env.EXPO_PUBLIC_DEMO_MODE === 'true' ||
+  Constants.expoConfig?.extra?.demoMode === true;
+
 export const SYNC_STALE_WARNING_MS = 15 * 60 * 1000; // warn if not synced in 15 minutes
 export const SCAN_UPLOAD_BATCH_SIZE = 25;

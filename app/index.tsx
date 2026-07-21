@@ -3,6 +3,9 @@ import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, View } from 'react-native';
 import { useScanner } from '@/context/ScannerContext';
 import { DatabaseService } from '@/services/DatabaseService';
+import { OfflineSessionService } from '@/services/OfflineSessionService';
+import { ApiClient } from '@/services/ApiClient';
+import { DEMO_MODE } from '@/config';
 
 export default function IndexScreen() {
   const [isLoading, setIsLoading] = useState(true);
@@ -12,13 +15,11 @@ export default function IndexScreen() {
   useEffect(() => {
     const checkAuthState = async () => {
       try {
-        // Check if scanner has recent login and remembered email
         const storedEmail = await DatabaseService.getStoredScannerEmail();
-        const isRecentLogin = await DatabaseService.isScannerLoginRecent();
-        
-        if (storedEmail && isRecentLogin) {
-          // Try to auto-login with stored credentials
-          const scanner = await DatabaseService.getScannerUserByEmail(storedEmail);
+        const session = storedEmail ? await OfflineSessionService.getValid(storedEmail) : null;
+        if (session && (session.mode === 'production' || DEMO_MODE)) {
+          await ApiClient.loadTokens();
+          const scanner = await DatabaseService.getScannerUserByEmail(session.email);
           if (scanner) {
             setScannerUser(scanner);
             setShouldAutoLogin(true);

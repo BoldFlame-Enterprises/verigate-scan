@@ -25,6 +25,19 @@ interface SyncResult {
   error?: string;
 }
 
+interface QueueAckResponse {
+  contract_version: 'queue-ack-v2';
+  results: {
+    client_record_id: string;
+    status: 'accepted' | 'duplicate' | 'rejected' | 'retryable_error';
+    error?: string;
+  }[];
+}
+
+interface RecordAckResponse {
+  status: 'accepted' | 'duplicate';
+}
+
 /** Retries a flaky network call with exponential backoff (Phase 7 hardening). */
 async function withBackoff<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
   let lastError: unknown;
@@ -44,7 +57,7 @@ async function withBackoff<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
 class SyncServiceClass {
   private deviceId: string | null = null;
 
-  private async getDeviceId(): Promise<string> {
+  async getDeviceId(): Promise<string> {
     if (this.deviceId) return this.deviceId;
     this.deviceId =
       Platform.OS === 'android'
@@ -67,9 +80,9 @@ class SyncServiceClass {
     return stored ? Number(stored) : null;
   }
 
-  /** Pulls users + areas for the event, uploads any queued scan logs /
-   * incidents / overrides, and reports a sync heartbeat. Fails open - the
-   * scanner keeps working offline against whatever was last synced. */
+  /** Pulls the selected event and uploads queued records under the event
+   * captured when each record was created. On failure the last trusted
+   * snapshot remains available for a bounded offline session. */
   async syncNow(): Promise<SyncResult> {
     try {
       if (!ApiClient.isAuthenticated()) {
@@ -86,20 +99,24 @@ class SyncServiceClass {
       eventId = event.id;
 
       const [usersData, areasData] = await Promise.all([
-        withBackoff(() => ApiClient.request<{ users: User[] }>('/sync/users-database', { params: { event_id: eventId! } })),
-        withBackoff(() => ApiClient.request<{ areas: { id: number; name: string; requires_scan: boolean }[] }>('/sync/areas-database', { params: { event_id: eventId! } })),
+        withBackoff(() => ApiClient.request<{ contract_version: string; users: User[] }>('/sync/users-database', { params: { event_id: eventId! } })),
+        withBackoff(() => ApiClient.request<{
+          areas: { id: number; name: string; requires_scan: boolean }[];
+          qr_authority_public_key: string;
+        }>('/sync/areas-database', { params: { event_id: eventId! } })),
       ]);
 
-      await DatabaseService.upsertSyncedUsers(usersData.users);
+      await DatabaseService.upsertSyncedUsers(eventId, usersData.users);
       await DatabaseService.upsertSyncedAreas(eventId, areasData.areas);
+      await DatabaseService.setQrAuthorityPublicKey(eventId, areasData.qr_authority_public_key);
 
       if (event.ends_at) {
         await DatabaseService.purgeIfEventExpired(new Date(event.ends_at).getTime());
       }
 
-      const uploadedScans = await this.uploadQueuedScans(eventId);
-      await this.uploadQueuedIncidents(eventId);
-      await this.uploadQueuedOverrides(eventId);
+      const uploadedScans = await this.uploadQueuedScans();
+      await this.uploadQueuedIncidents();
+      await this.uploadQueuedOverrides();
 
       await SecureStore.setItemAsync(CURRENT_EVENT_ID_KEY, String(eventId));
       await SecureStore.setItemAsync(CURRENT_EVENT_NAME_KEY, event.name);
@@ -124,15 +141,21 @@ class SyncServiceClass {
     }
   }
 
-  private async uploadQueuedScans(eventId: number): Promise<number> {
+  private async uploadQueuedScans(): Promise<number> {
     let totalUploaded = 0;
-    // Loop in batches so a very large offline backlog doesn't time out in one request.
-    for (;;) {
-      const pending = await DatabaseService.getUnsyncedScanLogs(SCAN_UPLOAD_BATCH_SIZE);
-      if (pending.length === 0) break;
+    const pending = await DatabaseService.getUnsyncedScanLogs(SCAN_UPLOAD_BATCH_SIZE);
+    const deviceId = await this.getDeviceId();
+    const groups = new Map<number, typeof pending>();
+    pending.forEach((record) => {
+      const group = groups.get(record.event_id) ?? [];
+      group.push(record);
+      groups.set(record.event_id, group);
+    });
 
-      const deviceId = await this.getDeviceId();
-      const logs = pending.map((log) => ({
+    for (const [eventId, records] of groups) {
+      const logs = records.map((log) => ({
+        client_record_id: log.device_scan_id,
+        event_id: log.event_id,
         user_id: log.user_id,
         area_id: log.area_id,
         access_granted: log.access_granted,
@@ -141,31 +164,41 @@ class SyncServiceClass {
         device_scan_id: log.device_scan_id,
       }));
 
-      await withBackoff(() =>
-        ApiClient.request('/sync/scan-logs', {
+      const response = await withBackoff(() =>
+        ApiClient.request<QueueAckResponse>('/sync/scan-logs', {
           method: 'POST',
           body: { logs, device_id: deviceId, event_id: eventId },
         })
       );
-
-      await DatabaseService.markScanLogsSynced(pending.map((p) => p.id));
-      totalUploaded += pending.length;
-
-      if (pending.length < SCAN_UPLOAD_BATCH_SIZE) break;
+      const acknowledged = new Set(
+        response.results
+          .filter((item) => item.status === 'accepted' || item.status === 'duplicate')
+          .map((item) => item.client_record_id)
+      );
+      const ids = records.filter((item) => item.device_scan_id && acknowledged.has(item.device_scan_id)).map((item) => item.id);
+      await DatabaseService.markScanLogsSynced(ids);
+      totalUploaded += ids.length;
     }
     return totalUploaded;
   }
 
-  private async uploadQueuedIncidents(eventId: number): Promise<void> {
+  private async uploadQueuedIncidents(): Promise<void> {
     const pending = await DatabaseService.getUnsyncedIncidents();
     const synced: number[] = [];
     for (const incident of pending) {
       try {
-        await ApiClient.request('/incidents', {
+        const response = await ApiClient.request<RecordAckResponse>('/incidents', {
           method: 'POST',
-          body: { event_id: eventId, category: incident.category, description: incident.description, area_id: incident.area_id ?? undefined },
+          body: {
+            client_record_id: incident.client_record_id,
+            event_id: incident.event_id,
+            category: incident.category,
+            description: incident.description,
+            area_id: incident.area_id ?? undefined,
+            occurred_at: incident.occurred_at,
+          },
         });
-        synced.push(incident.id);
+        if (response.status === 'accepted' || response.status === 'duplicate') synced.push(incident.id);
       } catch {
         break; // stop on first failure, retry the rest next sync
       }
@@ -173,7 +206,7 @@ class SyncServiceClass {
     await DatabaseService.markIncidentsSynced(synced);
   }
 
-  private async uploadQueuedOverrides(eventId: number): Promise<void> {
+  private async uploadQueuedOverrides(): Promise<void> {
     const pending = await DatabaseService.getUnsyncedOverrides();
     const synced: number[] = [];
     for (const override of pending) {
@@ -184,22 +217,24 @@ class SyncServiceClass {
       // trail isn't silently dropped on sync.
       let userId: number | undefined;
       if (override.user_email) {
-        const user = await DatabaseService.getUserByEmail(override.user_email);
+        const user = await DatabaseService.getUserByEmail(override.user_email, override.event_id);
         userId = user?.id;
       }
 
       try {
-        await ApiClient.request('/incidents/overrides', {
+        const response = await ApiClient.request<RecordAckResponse>('/incidents/overrides', {
           method: 'POST',
           body: {
-            event_id: eventId,
+            client_record_id: override.client_record_id,
+            event_id: override.event_id,
             area_id: override.area_id,
             access_granted: override.access_granted,
             reason: override.reason,
             user_id: userId,
+            occurred_at: override.occurred_at,
           },
         });
-        synced.push(override.id);
+        if (response.status === 'accepted' || response.status === 'duplicate') synced.push(override.id);
       } catch {
         break;
       }

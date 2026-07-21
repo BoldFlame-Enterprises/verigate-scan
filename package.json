@@ -26,6 +26,7 @@
     "sqlcipher": true
   },
   "dependencies": {
+    "@noble/curves": "^1.9.7",
     "@op-engineering/op-sqlite": "^9.2.7",
     "@react-native-picker/picker": "2.11.1",
     "expo": "~53.0.16",

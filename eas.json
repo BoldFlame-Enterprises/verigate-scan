@@ -12,7 +12,8 @@
         "gradleCommand": ":app:assembleDebug",
         "withoutCredentials": false,
         "env": {
-          "GRADLE_OPTS": "-Xmx2048m -XX:MaxMetaspaceSize=512m"
+          "GRADLE_OPTS": "-Xmx2048m -XX:MaxMetaspaceSize=512m",
+          "EXPO_PUBLIC_DEMO_MODE": "false"
         }
       }
     },
@@ -23,7 +24,8 @@
         "gradleCommand": ":app:assembleRelease",
         "withoutCredentials": false,
         "env": {
-          "GRADLE_OPTS": "-Xmx2048m -XX:MaxMetaspaceSize=512m"
+          "GRADLE_OPTS": "-Xmx2048m -XX:MaxMetaspaceSize=512m",
+          "EXPO_PUBLIC_DEMO_MODE": "false"
         }
       }
     },
@@ -33,7 +35,8 @@
         "buildType": "apk",
         "gradleCommand": ":app:assembleRelease",
         "env": {
-          "GRADLE_OPTS": "-Xmx2048m -XX:MaxMetaspaceSize=512m"
+          "GRADLE_OPTS": "-Xmx2048m -XX:MaxMetaspaceSize=512m",
+          "EXPO_PUBLIC_DEMO_MODE": "false"
         }
       }
     }

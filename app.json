@@ -65,7 +65,8 @@
       "eas": {
         "projectId": "796443f2-a1cb-4300-a2b9-0632479d7796"
       },
-      "apiBaseUrl": "http://localhost:3000/api"
+      "apiBaseUrl": "http://localhost:3000/api",
+      "demoMode": false
     }
   }
 }

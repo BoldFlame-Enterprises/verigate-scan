@@ -31,6 +31,7 @@
     "@react-native-picker/picker": "2.11.1",
     "expo": "~53.0.16",
     "expo-application": "~6.1.5",
+    "expo-asset": "~11.1.7",
     "expo-av": "~15.1.7",
     "expo-camera": "~16.1.10",
     "expo-constants": "~17.1.6",

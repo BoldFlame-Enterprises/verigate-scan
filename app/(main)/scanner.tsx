@@ -52,7 +52,7 @@ export default function ScannerScreen() {
   }, []);
 
   const refreshSyncedState = useCallback(async (result?: SyncResult, promptForArea = false) => {
-    const session = await OfflineSessionService.getValid(scannerUser?.email);
+    const session = await OfflineSessionService.getMetadata(scannerUser?.email);
     const id = result?.eventId ?? (await SyncService.getCurrentEventId()) ?? session?.eventId ?? null;
     const name = result?.eventName ?? await SyncService.getCurrentEventName();
     const syncedAt = await SyncService.getLastSyncAt();

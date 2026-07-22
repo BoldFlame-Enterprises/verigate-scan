@@ -106,7 +106,10 @@ export default function LoginScreen() {
       if (scannerUser) {
         // Store credentials if remember me is checked
         await DatabaseService.storeScannerCredentials(normalizedEmail, rememberMe);
-        await OfflineSessionService.create(scannerUser.id, normalizedEmail, eventId, mode);
+        await OfflineSessionService.create(scannerUser.id, normalizedEmail, eventId, mode, {
+          deviceId: await SyncService.getDeviceId(),
+          tokenBinding: ApiClient.getTokenBinding(),
+        });
         setScannerUser(scannerUser);
         router.replace('/(main)/scanner');
       } else {

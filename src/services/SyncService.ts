@@ -1,13 +1,16 @@
 import * as SecureStore from 'expo-secure-store';
 import * as Application from 'expo-application';
+import * as Crypto from 'expo-crypto';
 import { Platform } from 'react-native';
 import { ApiClient } from './ApiClient';
 import { DatabaseService, User } from './DatabaseService';
 import { SCAN_UPLOAD_BATCH_SIZE, SCAN_UPLOAD_MAX_BATCHES_PER_SYNC } from '../config';
+import { OfflineSessionService } from './OfflineSessionService';
 
 const CURRENT_EVENT_ID_KEY = 'verigate_scan_event_id';
 const CURRENT_EVENT_NAME_KEY = 'verigate_scan_event_name';
 const LAST_SYNC_AT_KEY = 'verigate_scan_last_sync_at';
+const FALLBACK_DEVICE_ID_KEY = 'verigate_scan_fallback_device_id';
 
 interface RemoteEvent {
   id: number;
@@ -60,10 +63,18 @@ class SyncServiceClass {
 
   async getDeviceId(): Promise<string> {
     if (this.deviceId) return this.deviceId;
-    this.deviceId =
-      Platform.OS === 'android'
-        ? (Application.getAndroidId() ?? `scan-${Date.now()}`)
-        : ((await Application.getIosIdForVendorAsync()) ?? `scan-${Date.now()}`);
+    const platformId = Platform.OS === 'android'
+      ? Application.getAndroidId()
+      : await Application.getIosIdForVendorAsync();
+    if (platformId) {
+      this.deviceId = platformId;
+      return this.deviceId;
+    }
+    this.deviceId = await SecureStore.getItemAsync(FALLBACK_DEVICE_ID_KEY);
+    if (!this.deviceId) {
+      this.deviceId = `scan-${Crypto.randomUUID()}`;
+      await SecureStore.setItemAsync(FALLBACK_DEVICE_ID_KEY, this.deviceId);
+    }
     return this.deviceId;
   }
 
@@ -133,6 +144,10 @@ class SyncServiceClass {
       await SecureStore.setItemAsync(LAST_SYNC_AT_KEY, String(Date.now()));
 
       const deviceId = await this.getDeviceId();
+      const tokenBinding = ApiClient.getTokenBinding();
+      if (tokenBinding) {
+        await OfflineSessionService.refreshProductionBinding({ eventId, deviceId, tokenBinding });
+      }
       await ApiClient.request('/notifications/sync-heartbeat', {
         method: 'POST',
         body: { device_id: deviceId, app: 'scan', event_id: eventId, platform: Platform.OS },

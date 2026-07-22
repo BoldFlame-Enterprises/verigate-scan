@@ -1,8 +1,10 @@
 import * as SecureStore from 'expo-secure-store';
+import * as Crypto from 'expo-crypto';
 import { API_BASE_URL } from '../config';
 
 const ACCESS_TOKEN_KEY = 'verigate_scan_access_token';
 const REFRESH_TOKEN_KEY = 'verigate_scan_refresh_token';
+const TOKEN_BINDING_KEY = 'verigate_scan_token_binding';
 
 export interface BackendUser {
   id: number;
@@ -23,28 +25,46 @@ interface APIResponse<T> {
 class ApiClientClass {
   private accessToken: string | null = null;
   private refreshToken: string | null = null;
+  private tokenBinding: string | null = null;
 
   async loadTokens(): Promise<void> {
-    this.accessToken = await SecureStore.getItemAsync(ACCESS_TOKEN_KEY);
-    this.refreshToken = await SecureStore.getItemAsync(REFRESH_TOKEN_KEY);
+    [this.accessToken, this.refreshToken, this.tokenBinding] = await Promise.all([
+      SecureStore.getItemAsync(ACCESS_TOKEN_KEY),
+      SecureStore.getItemAsync(REFRESH_TOKEN_KEY),
+      SecureStore.getItemAsync(TOKEN_BINDING_KEY),
+    ]);
   }
 
   isAuthenticated(): boolean {
     return !!this.accessToken;
   }
 
-  private async setTokens(accessToken: string, refreshToken: string): Promise<void> {
+  getTokenBinding(): string | null {
+    return this.tokenBinding;
+  }
+
+  private async setTokens(accessToken: string, refreshToken: string, rotateBinding = false): Promise<void> {
     this.accessToken = accessToken;
     this.refreshToken = refreshToken;
-    await SecureStore.setItemAsync(ACCESS_TOKEN_KEY, accessToken);
-    await SecureStore.setItemAsync(REFRESH_TOKEN_KEY, refreshToken);
+    if (rotateBinding || !this.tokenBinding) {
+      this.tokenBinding = Crypto.randomUUID();
+    }
+    await Promise.all([
+      SecureStore.setItemAsync(ACCESS_TOKEN_KEY, accessToken),
+      SecureStore.setItemAsync(REFRESH_TOKEN_KEY, refreshToken),
+      SecureStore.setItemAsync(TOKEN_BINDING_KEY, this.tokenBinding),
+    ]);
   }
 
   async clearTokens(): Promise<void> {
     this.accessToken = null;
     this.refreshToken = null;
-    await SecureStore.deleteItemAsync(ACCESS_TOKEN_KEY);
-    await SecureStore.deleteItemAsync(REFRESH_TOKEN_KEY);
+    this.tokenBinding = null;
+    await Promise.all([
+      SecureStore.deleteItemAsync(ACCESS_TOKEN_KEY),
+      SecureStore.deleteItemAsync(REFRESH_TOKEN_KEY),
+      SecureStore.deleteItemAsync(TOKEN_BINDING_KEY),
+    ]);
   }
 
   async login(email: string, password: string): Promise<BackendUser> {
@@ -57,7 +77,7 @@ class ApiClientClass {
     if (!res.ok || !json.success || !json.data) {
       throw new Error(json.error || 'Login failed');
     }
-    await this.setTokens(json.data.accessToken, json.data.refreshToken);
+    await this.setTokens(json.data.accessToken, json.data.refreshToken, true);
     return json.data.user;
   }
 

@@ -5,6 +5,7 @@ import { useScanner } from '@/context/ScannerContext';
 import { DatabaseService } from '@/services/DatabaseService';
 import { OfflineSessionService } from '@/services/OfflineSessionService';
 import { ApiClient } from '@/services/ApiClient';
+import { SyncService } from '@/services/SyncService';
 import { DEMO_MODE } from '@/config';
 
 export default function IndexScreen() {
@@ -16,14 +17,26 @@ export default function IndexScreen() {
     const checkAuthState = async () => {
       try {
         const storedEmail = await DatabaseService.getStoredScannerEmail();
-        const session = storedEmail ? await OfflineSessionService.getValid(storedEmail) : null;
-        if (session && (session.mode === 'production' || DEMO_MODE)) {
-          await ApiClient.loadTokens();
-          const scanner = await DatabaseService.getScannerUserByEmail(session.email);
-          if (scanner) {
-            setScannerUser(scanner);
-            setShouldAutoLogin(true);
-          }
+        await ApiClient.loadTokens();
+        const metadata = storedEmail ? await OfflineSessionService.getMetadata(storedEmail) : null;
+        const scanner = metadata
+          ? await DatabaseService.getScannerUserByEmail(metadata.email)
+          : null;
+        if (metadata && scanner && (metadata.mode === 'production' || DEMO_MODE)) {
+          const eventId = metadata.mode === 'production'
+            ? await SyncService.getCurrentEventId()
+            : metadata.eventId;
+          if (eventId == null) return;
+          const session = await OfflineSessionService.getValid({
+            userId: scanner.id,
+            email: metadata.email,
+            eventId,
+            deviceId: await SyncService.getDeviceId(),
+            tokenBinding: ApiClient.getTokenBinding(),
+          });
+          if (!session) return;
+          setScannerUser(scanner);
+          setShouldAutoLogin(true);
         }
       } catch (error) {
         console.error('Error checking auth state:', error);

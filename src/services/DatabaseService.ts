@@ -128,7 +128,9 @@ class DatabaseServiceClass {
     const users = await this.getDemoRegularUsers();
     const canonical = JSON.stringify({
       scanners: scanners.map((s) => ({ ...s })).sort((a, b) => a.id - b.id),
-      users: users.map((u) => ({ ...u })).sort((a, b) => a.id - b.id),
+      users: users.map((u) => ({ ...u })).sort((a, b) =>
+        (a.event_id ?? 0) - (b.event_id ?? 0) || a.id - b.id
+      ),
     });
     return Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonical);
   }
@@ -172,15 +174,17 @@ class DatabaseServiceClass {
     // Regular users table (to be scanned)
     await this.database.execAsync(`
       CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY,
-        email TEXT UNIQUE NOT NULL,
+        id INTEGER NOT NULL,
+        event_id INTEGER NOT NULL DEFAULT 0,
+        email TEXT NOT NULL,
         name TEXT NOT NULL,
         phone TEXT NOT NULL,
-        event_id INTEGER,
         assignments TEXT NOT NULL DEFAULT '[]',
         access_level TEXT NOT NULL,
         allowed_areas TEXT NOT NULL,
-        is_active INTEGER DEFAULT 1
+        is_active INTEGER DEFAULT 1,
+        PRIMARY KEY (event_id, id),
+        UNIQUE (event_id, email)
       );
     `);
 
@@ -258,6 +262,7 @@ class DatabaseServiceClass {
 
     await this.addColumnIfMissing('users', 'event_id', 'INTEGER');
     await this.addColumnIfMissing('users', 'assignments', "TEXT NOT NULL DEFAULT '[]'");
+    await this.migrateUsersToEventScopedIdentity();
     await this.addColumnIfMissing('scan_logs', 'event_id', 'INTEGER NOT NULL DEFAULT 0');
     await this.addColumnIfMissing('incidents_queue', 'client_record_id', 'TEXT');
     await this.addColumnIfMissing('incidents_queue', 'occurred_at', 'TEXT');
@@ -283,6 +288,45 @@ class DatabaseServiceClass {
     if (!columns.some((item) => item.name === column)) {
       await this.database.execAsync(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
     }
+  }
+
+  private async migrateUsersToEventScopedIdentity(): Promise<void> {
+    if (!this.database) throw new Error('Database not initialized');
+    const columns = await this.database.getAllAsync('PRAGMA table_info(users)') as {
+      name: string;
+      notnull: number;
+      pk: number;
+    }[];
+    const primaryKey = columns
+      .filter((column) => column.pk > 0)
+      .sort((left, right) => left.pk - right.pk)
+      .map((column) => column.name);
+    const eventColumn = columns.find((column) => column.name === 'event_id');
+    if (primaryKey.join(',') === 'event_id,id' && eventColumn?.notnull === 1) return;
+
+    await this.database.executeBatchAsync([
+      ['DROP TABLE IF EXISTS users_event_scoped'],
+      [`CREATE TABLE users_event_scoped (
+        id INTEGER NOT NULL,
+        event_id INTEGER NOT NULL DEFAULT 0,
+        email TEXT NOT NULL,
+        name TEXT NOT NULL,
+        phone TEXT NOT NULL,
+        assignments TEXT NOT NULL DEFAULT '[]',
+        access_level TEXT NOT NULL,
+        allowed_areas TEXT NOT NULL,
+        is_active INTEGER DEFAULT 1,
+        PRIMARY KEY (event_id, id),
+        UNIQUE (event_id, email)
+      )`],
+      [`INSERT INTO users_event_scoped
+        (id, event_id, email, name, phone, assignments, access_level, allowed_areas, is_active)
+       SELECT id, COALESCE(event_id, 0), email, name, phone, COALESCE(assignments, '[]'),
+              access_level, allowed_areas, is_active
+       FROM users`],
+      ['DROP TABLE users'],
+      ['ALTER TABLE users_event_scoped RENAME TO users'],
+    ]);
   }
 
   private async createAndStoreEncryptedSeedData(): Promise<void> {
@@ -370,7 +414,7 @@ class DatabaseServiceClass {
     }
 
     await this.database.runAsync(
-      'INSERT OR IGNORE INTO users (email, name, phone, access_level, allowed_areas, is_active) VALUES (?, ?, ?, ?, ?, ?)',
+      'INSERT OR IGNORE INTO users (event_id, email, name, phone, access_level, allowed_areas, is_active) VALUES (0, ?, ?, ?, ?, ?, ?)',
       [
         user.email,
         user.name,
@@ -518,7 +562,7 @@ class DatabaseServiceClass {
     return null;
   }
 
-  async getUserByEmail(email: string, eventId?: number): Promise<User | null> {
+  async getUserByEmail(email: string, eventId: number): Promise<User | null> {
     if (!this.database) {
       throw new Error('Database not initialized');
     }
@@ -526,8 +570,8 @@ class DatabaseServiceClass {
     const result = await this.database.getFirstAsync(
       `SELECT * FROM users
        WHERE email = ? AND is_active = 1
-         AND (? IS NULL OR event_id = ? OR (event_id IS NULL AND ? = 1))`,
-      [email, eventId ?? null, eventId ?? null, DEMO_MODE ? 1 : 0]
+         AND event_id = ?`,
+      [email, eventId]
     ) as any;
 
     if (result) {
@@ -579,25 +623,26 @@ class DatabaseServiceClass {
     if (!this.database) {
       throw new Error('Database not initialized');
     }
-    await this.database.runAsync('DELETE FROM users WHERE event_id = ?', [eventId]);
+    const commands: Parameters<SQLite.SQLiteDatabase['executeBatchAsync']>[0] = [
+      ['DELETE FROM users WHERE event_id = ?', [eventId]],
+    ];
     for (const user of users) {
+      if (user.event_id != null && user.event_id !== eventId) {
+        throw new Error(`Synchronized user ${user.id} belongs to event ${user.event_id}, not ${eventId}`);
+      }
       const assignments = user.assignments ?? [];
       const strongest = [...assignments].sort((a, b) => b.access_priority - a.access_priority)[0];
       const accessLevel = strongest?.access_level_name ?? user.access_level ?? 'Unassigned';
       const allowedAreas = [...new Set(assignments.map((assignment) => assignment.area_name))];
-      // A local demo-seeded row can hold this same email under a different
-      // (locally-generated) id. Since email is UNIQUE, upserting by id alone
-      // would violate that constraint in that case - clear the stale row first.
-      await this.database.runAsync(`DELETE FROM users WHERE email = ? AND id != ?`, [user.email, user.id]);
-
-      await this.database.runAsync(
+      commands.push(
+        ['DELETE FROM users WHERE event_id = ? AND email = ? AND id != ?', [eventId, user.email, user.id]],
+        [
         `INSERT INTO users (id, email, name, phone, event_id, assignments, access_level, allowed_areas, is_active)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
+         ON CONFLICT(event_id, id) DO UPDATE SET
            email = excluded.email,
            name = excluded.name,
            phone = excluded.phone,
-           event_id = excluded.event_id,
            assignments = excluded.assignments,
            access_level = excluded.access_level,
            allowed_areas = excluded.allowed_areas,
@@ -607,14 +652,16 @@ class DatabaseServiceClass {
           user.email,
           user.name,
           user.phone,
-          user.event_id ?? eventId,
+          eventId,
           JSON.stringify(assignments),
           accessLevel,
           JSON.stringify(allowedAreas),
           user.is_active ? 1 : 0,
+        ],
         ]
       );
     }
+    await this.database.executeBatchAsync(commands);
 
     // Sync is a legitimate data change - re-baseline the integrity checksum
     // so the next launch doesn't mistake this update for external tampering.

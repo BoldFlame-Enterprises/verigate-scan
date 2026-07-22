@@ -1,4 +1,4 @@
-import { open, type DB } from '@op-engineering/op-sqlite';
+import { open, type DB, type SQLBatchTuple } from '@op-engineering/op-sqlite';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
 
@@ -74,6 +74,10 @@ export class SQLiteDatabase {
   async runAsync(sql: string, params: unknown[] = []): Promise<{ lastInsertRowId: number; changes: number }> {
     const result = await this.db.execute(sql, params);
     return { lastInsertRowId: Number(result.insertId ?? 0), changes: result.rowsAffected ?? 0 };
+  }
+
+  async executeBatchAsync(commands: SQLBatchTuple[]): Promise<void> {
+    await this.db.executeBatch(commands);
   }
 
   async getFirstAsync<T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> {

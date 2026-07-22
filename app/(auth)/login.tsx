@@ -162,6 +162,8 @@ export default function LoginScreen() {
               value={email}
               onChangeText={setEmail}
               placeholder="Enter your scanner email"
+              placeholderTextColor="#6b7280"
+              selectionColor="#059669"
               keyboardType="email-address"
               autoCapitalize="none"
               autoCorrect={false}
@@ -174,6 +176,8 @@ export default function LoginScreen() {
               value={password}
               onChangeText={setPassword}
               placeholder={DEMO_MODE ? 'Blank selects explicit demo mode' : 'Enter your backend password'}
+              placeholderTextColor="#6b7280"
+              selectionColor="#059669"
               secureTextEntry
               autoCapitalize="none"
               autoCorrect={false}
@@ -321,6 +325,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     padding: 12,
     fontSize: 16,
+    color: '#111827',
     backgroundColor: '#f9fafb',
     marginBottom: 16,
   },

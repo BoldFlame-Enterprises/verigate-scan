@@ -136,7 +136,7 @@ export default function LoginScreen() {
 
     Alert.alert(
       'Demo Scanner Accounts',
-      `Available scanner accounts:\n\n${accountsList}${statsText}\n\nThese accounts can scan QR codes from the SportGate Pass app.`,
+      `Available scanner accounts:\n\n${accountsList}${statsText}\n\nThese accounts can scan QR codes from the VeriGate Pass app.`,
       [{ text: 'OK' }]
     );
   };
@@ -152,7 +152,7 @@ export default function LoginScreen() {
     >
       <ScrollView contentContainerStyle={styles.scrollContainer}>
         <View style={styles.content}>
-          <Text style={styles.title}>SportGate Scan</Text>
+          <Text style={styles.title}>VeriGate Scan</Text>
           <Text style={styles.subtitle}>Professional Access Control</Text>
 
           <View style={styles.formContainer}>

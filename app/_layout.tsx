@@ -9,7 +9,7 @@ export default function RootLayout() {
     const initializeApp = async () => {
       try {
         await DatabaseService.initDatabase();
-        console.log('✅ SportGateScan database initialized');
+        console.log('✅ VeriGate Scan database initialized');
       } catch (error) {
         console.error('❌ Failed to initialize database:', error);
       }

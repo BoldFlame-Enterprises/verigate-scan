@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -15,7 +15,8 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import { router } from 'expo-router';
 import { useScanner } from '../../src/context/ScannerContext';
 import { DatabaseService } from '../../src/services/DatabaseService';
-import { SyncService } from '../../src/services/SyncService';
+import { SyncResult, SyncService } from '../../src/services/SyncService';
+import { SyncScheduler } from '../../src/services/SyncScheduler';
 import { NotificationService } from '../../src/services/NotificationService';
 import { AudioFeedbackService } from '../../src/services/AudioFeedbackService';
 import { ApiClient } from '../../src/services/ApiClient';
@@ -33,8 +34,12 @@ export default function ScannerScreen() {
   const [activeModal, setActiveModal] = useState<Modal_>('none');
   const [availableAreas, setAvailableAreas] = useState<string[]>([]);
   const [eventId, setEventId] = useState<number | null>(null);
+  const [eventName, setEventName] = useState<string | null>(null);
   const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
+  const mountedRef = useRef(true);
+  const syncedStateRefreshRef = useRef<(result?: SyncResult, promptForArea?: boolean) => Promise<void>>(async () => undefined);
+  const authenticatedScannerId = scannerUser?.id;
 
   const isSecurityRole = scannerUser?.role === 'security' || scannerUser?.role === 'admin';
 
@@ -46,36 +51,58 @@ export default function ScannerScreen() {
     };
   }, []);
 
+  const refreshSyncedState = useCallback(async (result?: SyncResult, promptForArea = false) => {
+    const session = await OfflineSessionService.getValid(scannerUser?.email);
+    const id = result?.eventId ?? (await SyncService.getCurrentEventId()) ?? session?.eventId ?? null;
+    const name = result?.eventName ?? await SyncService.getCurrentEventName();
+    const syncedAt = await SyncService.getLastSyncAt();
+    const areas = id != null ? await DatabaseService.getSyncedAreas(id) : [];
+    const areaNames = areas.length > 0 ? areas.map((area) => area.name) : scannerUser?.allowed_areas ?? [];
+    const hasBackendWideAreaAccess = ApiClient.isAuthenticated()
+      && (scannerUser?.role === 'scanner' || scannerUser?.role === 'admin');
+    const visibleAreas = hasBackendWideAreaAccess
+      ? areaNames
+      : areaNames.filter((areaName) => !scannerUser || scannerUser.allowed_areas.includes(areaName));
+
+    if (!mountedRef.current) return;
+    setEventId(id);
+    setEventName(name);
+    setLastSyncAt(syncedAt ?? (result?.success ? Date.now() : null));
+    setAvailableAreas(visibleAreas);
+    if (promptForArea && !selectedArea && visibleAreas.length > 0) setActiveModal('area');
+    if (result?.success) await NotificationService.scheduleStaleWarning();
+  }, [scannerUser, selectedArea]);
+
+  syncedStateRefreshRef.current = refreshSyncedState;
+
   useEffect(() => {
-    (async () => {
-      const session = await OfflineSessionService.getValid(scannerUser?.email);
-      const id = (await SyncService.getCurrentEventId()) ?? session?.eventId ?? null;
-      setEventId(id);
-      setLastSyncAt(await SyncService.getLastSyncAt());
-
-      const areas = id != null ? await DatabaseService.getSyncedAreas(id) : [];
-      const areaNames = areas.length > 0 ? areas.map((a) => a.name) : scannerUser?.allowed_areas ?? [];
-      setAvailableAreas(areaNames.filter((name) => !scannerUser || scannerUser.allowed_areas.includes(name)));
-
-      if (!selectedArea && areaNames.length > 0) {
-        setActiveModal('area');
-      }
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    mountedRef.current = true;
+    void syncedStateRefreshRef.current(undefined, true);
+    return () => {
+      mountedRef.current = false;
+    };
   }, []);
+
+  useEffect(() => {
+    if (!authenticatedScannerId || !ApiClient.isAuthenticated()) return;
+    SyncScheduler.start({
+      onSuccess: (result) => syncedStateRefreshRef.current(result),
+    });
+    return () => SyncScheduler.stop();
+  }, [authenticatedScannerId]);
 
   const handleSyncNow = useCallback(async () => {
     setIsSyncing(true);
-    const result = await SyncService.syncNow();
-    setIsSyncing(false);
-
-    if (result.success) {
-      setLastSyncAt(Date.now());
-      setEventId(result.eventId ?? null);
-      await NotificationService.scheduleStaleWarning();
-      Alert.alert('Synced', `${result.eventName}: ${result.userCount} users, ${result.areaCount} areas, ${result.uploadedScans} scans uploaded.`);
-    } else {
-      Alert.alert('Sync failed', result.error ?? 'Unknown error (working offline)');
+    try {
+      const result = await SyncScheduler.syncNow();
+      if (!mountedRef.current) return;
+      if (result.success) {
+        Alert.alert('Synced', `${result.eventName}: ${result.userCount} users, ${result.areaCount} areas, ${result.uploadedScans} scans uploaded.`);
+      } else {
+        Alert.alert('Sync failed', result.error ?? 'Unknown error (working offline)');
+      }
+    } finally {
+      if (mountedRef.current) setIsSyncing(false);
     }
   }, []);
 
@@ -160,6 +187,7 @@ export default function ScannerScreen() {
           text: 'Logout',
           style: 'destructive',
           onPress: async () => {
+            SyncScheduler.stop();
             await DatabaseService.clearScannerCredentials();
             await OfflineSessionService.clear();
             await ApiClient.clearTokens();
@@ -256,6 +284,7 @@ export default function ScannerScreen() {
               </View>
             </View>
             <Text style={styles.scanCount}>Scans this session: {scanCount}</Text>
+            <Text style={styles.syncStatusText}>Event: {eventName ?? 'not selected'}</Text>
             <Text style={styles.syncStatusText}>
               Last sync: {lastSyncAt ? new Date(lastSyncAt).toLocaleTimeString() : 'never'}
             </Text>

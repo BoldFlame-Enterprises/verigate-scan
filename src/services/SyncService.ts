@@ -3,7 +3,7 @@ import * as Application from 'expo-application';
 import { Platform } from 'react-native';
 import { ApiClient } from './ApiClient';
 import { DatabaseService, User } from './DatabaseService';
-import { SCAN_UPLOAD_BATCH_SIZE } from '../config';
+import { SCAN_UPLOAD_BATCH_SIZE, SCAN_UPLOAD_MAX_BATCHES_PER_SYNC } from '../config';
 
 const CURRENT_EVENT_ID_KEY = 'verigate_scan_event_id';
 const CURRENT_EVENT_NAME_KEY = 'verigate_scan_event_name';
@@ -15,7 +15,7 @@ interface RemoteEvent {
   ends_at: string | null;
 }
 
-interface SyncResult {
+export interface SyncResult {
   success: boolean;
   eventId?: number;
   eventName?: string;
@@ -56,6 +56,7 @@ async function withBackoff<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
 
 class SyncServiceClass {
   private deviceId: string | null = null;
+  private inFlight: Promise<SyncResult> | null = null;
 
   async getDeviceId(): Promise<string> {
     if (this.deviceId) return this.deviceId;
@@ -84,6 +85,15 @@ class SyncServiceClass {
    * captured when each record was created. On failure the last trusted
    * snapshot remains available for a bounded offline session. */
   async syncNow(): Promise<SyncResult> {
+    if (this.inFlight) return this.inFlight;
+
+    this.inFlight = this.performSync().finally(() => {
+      this.inFlight = null;
+    });
+    return this.inFlight;
+  }
+
+  private async performSync(): Promise<SyncResult> {
     try {
       if (!ApiClient.isAuthenticated()) {
         return { success: false, error: 'Not authenticated with backend' };
@@ -143,41 +153,59 @@ class SyncServiceClass {
 
   private async uploadQueuedScans(): Promise<number> {
     let totalUploaded = 0;
-    const pending = await DatabaseService.getUnsyncedScanLogs(SCAN_UPLOAD_BATCH_SIZE);
     const deviceId = await this.getDeviceId();
-    const groups = new Map<number, typeof pending>();
-    pending.forEach((record) => {
-      const group = groups.get(record.event_id) ?? [];
-      group.push(record);
-      groups.set(record.event_id, group);
-    });
+    const maximumBatches = SCAN_UPLOAD_MAX_BATCHES_PER_SYNC ?? 1;
 
-    for (const [eventId, records] of groups) {
-      const logs = records.map((log) => ({
-        client_record_id: log.device_scan_id,
-        event_id: log.event_id,
-        user_id: log.user_id,
-        area_id: log.area_id,
-        access_granted: log.access_granted,
-        failure_reason: log.failure_reason,
-        scanned_at: log.scanned_at,
-        device_scan_id: log.device_scan_id,
-      }));
+    for (let batchNumber = 0; batchNumber < maximumBatches; batchNumber += 1) {
+      const pending = await DatabaseService.getUnsyncedScanLogs(SCAN_UPLOAD_BATCH_SIZE);
+      if (pending.length === 0) break;
 
-      const response = await withBackoff(() =>
-        ApiClient.request<QueueAckResponse>('/sync/scan-logs', {
-          method: 'POST',
-          body: { logs, device_id: deviceId, event_id: eventId },
-        })
-      );
-      const acknowledged = new Set(
-        response.results
-          .filter((item) => item.status === 'accepted' || item.status === 'duplicate')
-          .map((item) => item.client_record_id)
-      );
-      const ids = records.filter((item) => item.device_scan_id && acknowledged.has(item.device_scan_id)).map((item) => item.id);
-      await DatabaseService.markScanLogsSynced(ids);
-      totalUploaded += ids.length;
+      const groups = new Map<number, typeof pending>();
+      pending.forEach((record) => {
+        const group = groups.get(record.event_id) ?? [];
+        group.push(record);
+        groups.set(record.event_id, group);
+      });
+
+      let uploadedThisBatch = 0;
+      let receivedRetryableFailure = false;
+      for (const [eventId, records] of groups) {
+        const logs = records.map((log) => ({
+          client_record_id: log.device_scan_id,
+          event_id: log.event_id,
+          user_id: log.user_id,
+          area_id: log.area_id,
+          access_granted: log.access_granted,
+          failure_reason: log.failure_reason,
+          scanned_at: log.scanned_at,
+          device_scan_id: log.device_scan_id,
+        }));
+
+        const response = await withBackoff(() =>
+          ApiClient.request<QueueAckResponse>('/sync/scan-logs', {
+            method: 'POST',
+            body: { logs, device_id: deviceId, event_id: eventId },
+          })
+        );
+        const acknowledged = new Set(
+          response.results
+            .filter((item) => item.status === 'accepted' || item.status === 'duplicate')
+            .map((item) => item.client_record_id)
+        );
+        receivedRetryableFailure ||= response.results.some((item) => item.status === 'retryable_error');
+        const ids = records
+          .filter((item) => item.device_scan_id && acknowledged.has(item.device_scan_id))
+          .map((item) => item.id);
+        await DatabaseService.markScanLogsSynced(ids);
+        uploadedThisBatch += ids.length;
+      }
+
+      totalUploaded += uploadedThisBatch;
+      if (
+        pending.length < SCAN_UPLOAD_BATCH_SIZE
+        || receivedRetryableFailure
+        || uploadedThisBatch === 0
+      ) break;
     }
     return totalUploaded;
   }

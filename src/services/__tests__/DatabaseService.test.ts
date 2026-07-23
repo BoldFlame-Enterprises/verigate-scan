@@ -164,4 +164,68 @@ describe('DatabaseService event-scoped users', () => {
 
     expect(executeBatch).toHaveBeenCalledWith(commands);
   });
+
+  it('adds queue attempt and terminal columns idempotently without replacing queue rows', async () => {
+    const database = createDatabaseDouble();
+    database.getAllAsync.mockImplementation(async (sql) => {
+      if (sql.includes('PRAGMA table_info(users)')) {
+        return [
+          { name: 'event_id', notnull: 1, pk: 1 },
+          { name: 'id', notnull: 1, pk: 2 },
+          { name: 'assignments', notnull: 1, pk: 0 },
+        ];
+      }
+      if (sql.includes('PRAGMA table_info(incidents_queue)') || sql.includes('PRAGMA table_info(overrides_queue)')) {
+        return [
+          { name: 'client_record_id' },
+          { name: 'occurred_at' },
+        ];
+      }
+      return [];
+    });
+    service.database = database;
+
+    await service.createTables();
+
+    const migrationSql = database.execAsync.mock.calls.map(([sql]) => compact(sql));
+    for (const table of ['incidents_queue', 'overrides_queue']) {
+      expect(migrationSql).toEqual(expect.arrayContaining([
+        `ALTER TABLE ${table} ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0`,
+        `ALTER TABLE ${table} ADD COLUMN last_attempt_at TEXT`,
+        `ALTER TABLE ${table} ADD COLUMN last_error TEXT`,
+        `ALTER TABLE ${table} ADD COLUMN terminal_failure INTEGER NOT NULL DEFAULT 0`,
+      ]));
+    }
+    expect(migrationSql.some((sql) => sql.includes('DELETE FROM incidents_queue'))).toBe(false);
+    expect(migrationSql.some((sql) => sql.includes('DELETE FROM overrides_queue'))).toBe(false);
+  });
+
+  it('reads bounded non-terminal queue rows and stores bounded failure metadata', async () => {
+    const database = createDatabaseDouble();
+    database.getAllAsync
+      .mockResolvedValueOnce([{ id: 1, terminal_failure: 0 }])
+      .mockResolvedValueOnce([{ id: 2, terminal_failure: 0, access_granted: 1 }]);
+    service.database = database;
+
+    await DatabaseService.getUnsyncedIncidents(10);
+    await DatabaseService.getUnsyncedOverrides(10);
+    await DatabaseService.recordIncidentFailure(1, `network\n${'x'.repeat(700)}`, false);
+    await DatabaseService.recordOverrideFailure(2, 'missing area', true);
+
+    expect(database.getAllAsync).toHaveBeenNthCalledWith(
+      1,
+      expect.stringContaining('terminal_failure = 0'),
+      [10]
+    );
+    expect(database.getAllAsync).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining('LIMIT ?'),
+      [10]
+    );
+    const incidentFailure = database.runAsync.mock.calls[0];
+    expect(compact(incidentFailure[0])).toContain('attempt_count = attempt_count + 1');
+    expect((incidentFailure[1]?.[1] as string).length).toBe(500);
+    expect(incidentFailure[1]?.slice(2)).toEqual([0, 1]);
+    expect(database.runAsync.mock.calls[1][1]?.slice(2)).toEqual([1, 2]);
+  });
 });

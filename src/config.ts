@@ -12,3 +12,5 @@ export const DEMO_MODE: boolean =
 export const SYNC_STALE_WARNING_MS = 15 * 60 * 1000; // warn if not synced in 15 minutes
 export const SCAN_UPLOAD_BATCH_SIZE = 25;
 export const SCAN_UPLOAD_MAX_BATCHES_PER_SYNC = 4;
+export const AUXILIARY_UPLOAD_BATCH_SIZE = 10;
+export const AUXILIARY_UPLOAD_MAX_BATCHES_PER_SYNC = 2;

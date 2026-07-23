@@ -22,6 +22,34 @@ interface APIResponse<T> {
   message?: string;
 }
 
+export interface SafeApiErrorData {
+  contract_version?: string;
+  client_record_id?: string;
+  status?: string;
+  error?: string;
+}
+
+function safeErrorData(value: unknown): SafeApiErrorData | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const source = value as Record<string, unknown>;
+  const safe: SafeApiErrorData = {};
+  for (const key of ['contract_version', 'client_record_id', 'status', 'error'] as const) {
+    if (typeof source[key] === 'string') safe[key] = source[key] as string;
+  }
+  return Object.keys(safe).length > 0 ? safe : undefined;
+}
+
+export class ApiError extends Error {
+  constructor(
+    public readonly statusCode: number,
+    message: string,
+    public readonly responseData?: SafeApiErrorData
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 class ApiClientClass {
   private accessToken: string | null = null;
   private refreshToken: string | null = null;
@@ -126,7 +154,11 @@ class ApiClientClass {
 
     const json: APIResponse<T> = await res.json();
     if (!res.ok || !json.success) {
-      throw new Error(json.error || `Request failed: ${path}`);
+      throw new ApiError(
+        res.status,
+        json.error || `Request failed: ${path}`,
+        safeErrorData(json.data)
+      );
     }
     return json.data as T;
   }

@@ -10,7 +10,7 @@ jest.mock('expo-crypto', () => ({ randomUUID: jest.fn() }));
 jest.mock('../../config', () => ({ API_BASE_URL: 'https://api.example.test' }));
 
 import * as Crypto from 'expo-crypto';
-import { ApiClient } from '../ApiClient';
+import { ApiClient, ApiError } from '../ApiClient';
 
 const response = (status: number, body: unknown) => ({
   status,
@@ -63,5 +63,48 @@ describe('ApiClient token binding', () => {
     await ApiClient.clearTokens();
     expect(ApiClient.getTokenBinding()).toBeNull();
     expect(mockStore.has('verigate_scan_token_binding')).toBe(false);
+  });
+
+  it('preserves safe HTTP status and queue metadata without exposing token fields', async () => {
+    jest.mocked(global.fetch)
+      .mockResolvedValueOnce(response(200, {
+        success: true,
+        data: {
+          user: { id: 2, email: 'scanner@example.com', name: 'Scanner', phone: '1', role: 'scanner', is_active: true },
+          accessToken: 'access-1',
+          refreshToken: 'refresh-1',
+        },
+      }) as never)
+      .mockResolvedValueOnce(response(422, {
+        success: false,
+        error: 'Record rejected',
+        data: {
+          contract_version: 'queue-ack-v2',
+          client_record_id: 'incident-001',
+          status: 'rejected',
+          accessToken: 'must-not-escape',
+          refreshToken: 'must-not-escape',
+        },
+      }) as never);
+
+    await ApiClient.login('scanner@example.com', 'password');
+
+    const requestPromise = ApiClient.request('/incidents', { method: 'POST' });
+    await expect(requestPromise).rejects.toMatchObject({
+      name: 'ApiError',
+      statusCode: 422,
+      responseData: {
+        contract_version: 'queue-ack-v2',
+        client_record_id: 'incident-001',
+        status: 'rejected',
+      },
+    } satisfies Partial<ApiError>);
+
+    try {
+      await requestPromise;
+    } catch (error) {
+      expect((error as ApiError).responseData).not.toHaveProperty('accessToken');
+      expect((error as ApiError).responseData).not.toHaveProperty('refreshToken');
+    }
   });
 });

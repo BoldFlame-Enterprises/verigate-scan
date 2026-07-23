@@ -2,9 +2,14 @@ import * as SecureStore from 'expo-secure-store';
 import * as Application from 'expo-application';
 import * as Crypto from 'expo-crypto';
 import { Platform } from 'react-native';
-import { ApiClient } from './ApiClient';
+import { ApiClient, ApiError } from './ApiClient';
 import { DatabaseService, User } from './DatabaseService';
-import { SCAN_UPLOAD_BATCH_SIZE, SCAN_UPLOAD_MAX_BATCHES_PER_SYNC } from '../config';
+import {
+  AUXILIARY_UPLOAD_BATCH_SIZE,
+  AUXILIARY_UPLOAD_MAX_BATCHES_PER_SYNC,
+  SCAN_UPLOAD_BATCH_SIZE,
+  SCAN_UPLOAD_MAX_BATCHES_PER_SYNC,
+} from '../config';
 import { OfflineSessionService } from './OfflineSessionService';
 
 const CURRENT_EVENT_ID_KEY = 'verigate_scan_event_id';
@@ -38,7 +43,15 @@ interface QueueAckResponse {
 }
 
 interface RecordAckResponse {
+  contract_version: 'queue-ack-v2';
+  client_record_id: string;
   status: 'accepted' | 'duplicate';
+}
+
+interface AuxiliaryUploadResult {
+  success: boolean;
+  uploaded: number;
+  error?: string;
 }
 
 /** Retries a flaky network call with exponential backoff for resilience. */
@@ -136,8 +149,30 @@ class SyncServiceClass {
       }
 
       const uploadedScans = await this.uploadQueuedScans();
-      await this.uploadQueuedIncidents();
-      await this.uploadQueuedOverrides();
+      const incidentUpload = await this.uploadQueuedIncidents();
+      if (!incidentUpload.success) {
+        return {
+          success: false,
+          eventId,
+          eventName: event.name,
+          userCount: usersData.users.length,
+          areaCount: areasData.areas.length,
+          uploadedScans,
+          error: incidentUpload.error ?? 'Incident queue upload did not complete safely',
+        };
+      }
+      const overrideUpload = await this.uploadQueuedOverrides();
+      if (!overrideUpload.success) {
+        return {
+          success: false,
+          eventId,
+          eventName: event.name,
+          userCount: usersData.users.length,
+          areaCount: areasData.areas.length,
+          uploadedScans,
+          error: overrideUpload.error ?? 'Override queue upload did not complete safely',
+        };
+      }
 
       await SecureStore.setItemAsync(CURRENT_EVENT_ID_KEY, String(eventId));
       await SecureStore.setItemAsync(CURRENT_EVENT_NAME_KEY, event.name);
@@ -225,64 +260,140 @@ class SyncServiceClass {
     return totalUploaded;
   }
 
-  private async uploadQueuedIncidents(): Promise<void> {
-    const pending = await DatabaseService.getUnsyncedIncidents();
-    const synced: number[] = [];
-    for (const incident of pending) {
-      try {
-        const response = await ApiClient.request<RecordAckResponse>('/incidents', {
-          method: 'POST',
-          body: {
-            client_record_id: incident.client_record_id,
-            event_id: incident.event_id,
-            category: incident.category,
-            description: incident.description,
-            area_id: incident.area_id ?? undefined,
-            occurred_at: incident.occurred_at,
-          },
-        });
-        if (response.status === 'accepted' || response.status === 'duplicate') synced.push(incident.id);
-      } catch {
-        break; // stop on first failure, retry the rest next sync
-      }
-    }
-    await DatabaseService.markIncidentsSynced(synced);
+  private isAcceptedAcknowledgement(response: RecordAckResponse, clientRecordId: string): boolean {
+    return response.contract_version === 'queue-ack-v2'
+      && response.client_record_id === clientRecordId
+      && (response.status === 'accepted' || response.status === 'duplicate');
   }
 
-  private async uploadQueuedOverrides(): Promise<void> {
-    const pending = await DatabaseService.getUnsyncedOverrides();
-    const synced: number[] = [];
-    for (const override of pending) {
-      if (!override.area_id) continue; // can't resolve the area id yet; retry next sync
+  private isTerminalRejection(error: unknown): error is ApiError {
+    return error instanceof ApiError
+      && error.statusCode >= 400
+      && error.statusCode < 500
+      && error.statusCode !== 401
+      && error.statusCode !== 403
+      && error.responseData?.contract_version === 'queue-ack-v2'
+      && error.responseData.status === 'rejected';
+  }
 
-      // Resolve the attendee's email (captured at override time) to the
-      // backend's real numeric user id, so the override's accountability
-      // trail isn't silently dropped on sync.
-      let userId: number | undefined;
-      if (override.user_email) {
-        const user = await DatabaseService.getUserByEmail(override.user_email, override.event_id);
-        userId = user?.id;
+  private isSessionFailure(error: unknown): error is ApiError {
+    return error instanceof ApiError && (error.statusCode === 401 || error.statusCode === 403);
+  }
+
+  private queueError(error: unknown): string {
+    return error instanceof Error ? error.message : 'Queue upload failed';
+  }
+
+  private async uploadQueuedIncidents(): Promise<AuxiliaryUploadResult> {
+    let totalUploaded = 0;
+    for (let batch = 0; batch < AUXILIARY_UPLOAD_MAX_BATCHES_PER_SYNC; batch += 1) {
+      const pending = await DatabaseService.getUnsyncedIncidents(AUXILIARY_UPLOAD_BATCH_SIZE);
+      if (pending.length === 0) break;
+      let progress = 0;
+
+      for (const incident of pending) {
+        try {
+          const response = await ApiClient.request<RecordAckResponse>('/incidents', {
+            method: 'POST',
+            body: {
+              client_record_id: incident.client_record_id,
+              event_id: incident.event_id,
+              category: incident.category,
+              description: incident.description,
+              area_id: incident.area_id ?? undefined,
+              occurred_at: incident.occurred_at,
+            },
+          });
+          if (!this.isAcceptedAcknowledgement(response, incident.client_record_id)) {
+            await DatabaseService.recordIncidentFailure(incident.id, 'Invalid queue acknowledgement', false);
+            return { success: false, uploaded: totalUploaded, error: 'Incident acknowledgement was invalid' };
+          }
+          await DatabaseService.markIncidentsSynced([incident.id]);
+          totalUploaded += 1;
+          progress += 1;
+        } catch (error) {
+          if (this.isSessionFailure(error)) {
+            return { success: false, uploaded: totalUploaded, error: 'Incident upload requires a valid session' };
+          }
+          if (this.isTerminalRejection(error)) {
+            await DatabaseService.recordIncidentFailure(incident.id, this.queueError(error), true);
+            progress += 1;
+            continue;
+          }
+          await DatabaseService.recordIncidentFailure(incident.id, this.queueError(error), false);
+          return { success: false, uploaded: totalUploaded, error: 'Incident upload will retry later' };
+        }
       }
 
-      try {
-        const response = await ApiClient.request<RecordAckResponse>('/incidents/overrides', {
-          method: 'POST',
-          body: {
-            client_record_id: override.client_record_id,
-            event_id: override.event_id,
-            area_id: override.area_id,
-            access_granted: override.access_granted,
-            reason: override.reason,
-            user_id: userId,
-            occurred_at: override.occurred_at,
-          },
-        });
-        if (response.status === 'accepted' || response.status === 'duplicate') synced.push(override.id);
-      } catch {
-        break;
+      if (pending.length < AUXILIARY_UPLOAD_BATCH_SIZE) break;
+      if (progress === 0) {
+        return { success: false, uploaded: totalUploaded, error: 'Incident queue made no progress' };
       }
     }
-    await DatabaseService.markOverridesSynced(synced);
+    return { success: true, uploaded: totalUploaded };
+  }
+
+  private async uploadQueuedOverrides(): Promise<AuxiliaryUploadResult> {
+    let totalUploaded = 0;
+    for (let batch = 0; batch < AUXILIARY_UPLOAD_MAX_BATCHES_PER_SYNC; batch += 1) {
+      const pending = await DatabaseService.getUnsyncedOverrides(AUXILIARY_UPLOAD_BATCH_SIZE);
+      if (pending.length === 0) break;
+      let progress = 0;
+
+      for (const override of pending) {
+        if (!override.area_id) {
+          await DatabaseService.recordOverrideFailure(override.id, 'Queued override is missing area_id', true);
+          progress += 1;
+          continue;
+        }
+
+        try {
+          // Resolve the attendee identity within the event captured when the
+          // record was created; never substitute the currently selected event.
+          let userId: number | undefined;
+          if (override.user_email) {
+            const user = await DatabaseService.getUserByEmail(override.user_email, override.event_id);
+            userId = user?.id;
+          }
+          const response = await ApiClient.request<RecordAckResponse>('/incidents/overrides', {
+            method: 'POST',
+            body: {
+              client_record_id: override.client_record_id,
+              event_id: override.event_id,
+              area_id: override.area_id,
+              access_granted: override.access_granted,
+              reason: override.reason,
+              user_id: userId,
+              occurred_at: override.occurred_at,
+            },
+          });
+          if (!this.isAcceptedAcknowledgement(response, override.client_record_id)) {
+            await DatabaseService.recordOverrideFailure(override.id, 'Invalid queue acknowledgement', false);
+            return { success: false, uploaded: totalUploaded, error: 'Override acknowledgement was invalid' };
+          }
+          await DatabaseService.markOverridesSynced([override.id]);
+          totalUploaded += 1;
+          progress += 1;
+        } catch (error) {
+          if (this.isSessionFailure(error)) {
+            return { success: false, uploaded: totalUploaded, error: 'Override upload requires a valid session' };
+          }
+          if (this.isTerminalRejection(error)) {
+            await DatabaseService.recordOverrideFailure(override.id, this.queueError(error), true);
+            progress += 1;
+            continue;
+          }
+          await DatabaseService.recordOverrideFailure(override.id, this.queueError(error), false);
+          return { success: false, uploaded: totalUploaded, error: 'Override upload will retry later' };
+        }
+      }
+
+      if (pending.length < AUXILIARY_UPLOAD_BATCH_SIZE) break;
+      if (progress === 0) {
+        return { success: false, uploaded: totalUploaded, error: 'Override queue made no progress' };
+      }
+    }
+    return { success: true, uploaded: totalUploaded };
   }
 }
 

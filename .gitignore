@@ -184,6 +184,11 @@ coverage/
 # Security
 *.pem
 *.key
+credentials.json
+*.jks
+*.p8
+*.p12
+*.mobileprovision
 *.crt
 *.csr
 secrets/

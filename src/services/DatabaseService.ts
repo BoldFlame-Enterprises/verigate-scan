@@ -48,6 +48,10 @@ export interface QueuedIncident {
   category: string;
   description: string;
   occurred_at: string;
+  attempt_count: number;
+  last_attempt_at: string | null;
+  last_error: string | null;
+  terminal_failure: boolean;
 }
 
 export interface QueuedOverride {
@@ -60,7 +64,13 @@ export interface QueuedOverride {
   access_granted: boolean;
   reason: string;
   occurred_at: string;
+  attempt_count: number;
+  last_attempt_at: string | null;
+  last_error: string | null;
+  terminal_failure: boolean;
 }
+
+const MAX_QUEUE_ERROR_LENGTH = 500;
 
 class DatabaseServiceClass {
   private database: SQLite.SQLiteDatabase | null = null;
@@ -232,7 +242,11 @@ class DatabaseServiceClass {
         description TEXT NOT NULL,
         occurred_at TEXT NOT NULL,
         created_at TEXT,
-        synced INTEGER DEFAULT 0
+        synced INTEGER DEFAULT 0,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at TEXT,
+        last_error TEXT,
+        terminal_failure INTEGER NOT NULL DEFAULT 0
       );
     `);
 
@@ -248,7 +262,11 @@ class DatabaseServiceClass {
         reason TEXT NOT NULL,
         occurred_at TEXT NOT NULL,
         created_at TEXT,
-        synced INTEGER DEFAULT 0
+        synced INTEGER DEFAULT 0,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at TEXT,
+        last_error TEXT,
+        terminal_failure INTEGER NOT NULL DEFAULT 0
       );
     `);
 
@@ -266,8 +284,16 @@ class DatabaseServiceClass {
     await this.addColumnIfMissing('scan_logs', 'event_id', 'INTEGER NOT NULL DEFAULT 0');
     await this.addColumnIfMissing('incidents_queue', 'client_record_id', 'TEXT');
     await this.addColumnIfMissing('incidents_queue', 'occurred_at', 'TEXT');
+    await this.addColumnIfMissing('incidents_queue', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
+    await this.addColumnIfMissing('incidents_queue', 'last_attempt_at', 'TEXT');
+    await this.addColumnIfMissing('incidents_queue', 'last_error', 'TEXT');
+    await this.addColumnIfMissing('incidents_queue', 'terminal_failure', 'INTEGER NOT NULL DEFAULT 0');
     await this.addColumnIfMissing('overrides_queue', 'client_record_id', 'TEXT');
     await this.addColumnIfMissing('overrides_queue', 'occurred_at', 'TEXT');
+    await this.addColumnIfMissing('overrides_queue', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
+    await this.addColumnIfMissing('overrides_queue', 'last_attempt_at', 'TEXT');
+    await this.addColumnIfMissing('overrides_queue', 'last_error', 'TEXT');
+    await this.addColumnIfMissing('overrides_queue', 'terminal_failure', 'INTEGER NOT NULL DEFAULT 0');
     await this.database.execAsync(`
       UPDATE incidents_queue
       SET client_record_id = COALESCE(client_record_id, 'legacy-incident-' || id),
@@ -763,15 +789,28 @@ class DatabaseServiceClass {
     );
   }
 
-  async getUnsyncedIncidents(): Promise<QueuedIncident[]> {
+  async getUnsyncedIncidents(limit: number): Promise<QueuedIncident[]> {
     if (!this.database) throw new Error('Database not initialized');
-    return (await this.database.getAllAsync('SELECT * FROM incidents_queue WHERE synced = 0 ORDER BY id ASC')) as any[];
+    const rows = (await this.database.getAllAsync(
+      'SELECT * FROM incidents_queue WHERE synced = 0 AND terminal_failure = 0 ORDER BY id ASC LIMIT ?',
+      [limit]
+    )) as any[];
+    return rows.map((row) => ({ ...row, terminal_failure: row.terminal_failure === 1 }));
   }
 
   async markIncidentsSynced(ids: number[]): Promise<void> {
     if (!this.database || ids.length === 0) return;
     const placeholders = ids.map(() => '?').join(',');
-    await this.database.runAsync(`UPDATE incidents_queue SET synced = 1 WHERE id IN (${placeholders})`, ids);
+    await this.database.runAsync(
+      `UPDATE incidents_queue
+       SET synced = 1, last_error = NULL, terminal_failure = 0
+       WHERE id IN (${placeholders})`,
+      ids
+    );
+  }
+
+  async recordIncidentFailure(id: number, error: string, terminal: boolean): Promise<void> {
+    await this.recordQueueFailure('incidents_queue', id, error, terminal);
   }
 
   async queueOverride(
@@ -793,16 +832,51 @@ class DatabaseServiceClass {
     );
   }
 
-  async getUnsyncedOverrides(): Promise<QueuedOverride[]> {
+  async getUnsyncedOverrides(limit: number): Promise<QueuedOverride[]> {
     if (!this.database) throw new Error('Database not initialized');
-    const rows = (await this.database.getAllAsync('SELECT * FROM overrides_queue WHERE synced = 0 ORDER BY id ASC')) as any[];
-    return rows.map((row) => ({ ...row, access_granted: row.access_granted === 1 }));
+    const rows = (await this.database.getAllAsync(
+      'SELECT * FROM overrides_queue WHERE synced = 0 AND terminal_failure = 0 ORDER BY id ASC LIMIT ?',
+      [limit]
+    )) as any[];
+    return rows.map((row) => ({
+      ...row,
+      access_granted: row.access_granted === 1,
+      terminal_failure: row.terminal_failure === 1,
+    }));
   }
 
   async markOverridesSynced(ids: number[]): Promise<void> {
     if (!this.database || ids.length === 0) return;
     const placeholders = ids.map(() => '?').join(',');
-    await this.database.runAsync(`UPDATE overrides_queue SET synced = 1 WHERE id IN (${placeholders})`, ids);
+    await this.database.runAsync(
+      `UPDATE overrides_queue
+       SET synced = 1, last_error = NULL, terminal_failure = 0
+       WHERE id IN (${placeholders})`,
+      ids
+    );
+  }
+
+  async recordOverrideFailure(id: number, error: string, terminal: boolean): Promise<void> {
+    await this.recordQueueFailure('overrides_queue', id, error, terminal);
+  }
+
+  private async recordQueueFailure(
+    table: 'incidents_queue' | 'overrides_queue',
+    id: number,
+    error: string,
+    terminal: boolean
+  ): Promise<void> {
+    if (!this.database) throw new Error('Database not initialized');
+    const safeError = error.replace(/[\r\n\t]+/g, ' ').slice(0, MAX_QUEUE_ERROR_LENGTH);
+    await this.database.runAsync(
+      `UPDATE ${table}
+       SET attempt_count = attempt_count + 1,
+           last_attempt_at = ?,
+           last_error = ?,
+           terminal_failure = ?
+       WHERE id = ?`,
+      [new Date().toISOString(), safeError, terminal ? 1 : 0, id]
+    );
   }
 
   async getScanLogs(limit: number = 50): Promise<ScanLog[]> {

@@ -188,6 +188,7 @@ export default function ScannerScreen() {
           style: 'destructive',
           onPress: async () => {
             SyncScheduler.stop();
+            await NotificationService.cancelStaleWarning();
             await DatabaseService.clearScannerCredentials();
             await OfflineSessionService.clear();
             await ApiClient.clearTokens();

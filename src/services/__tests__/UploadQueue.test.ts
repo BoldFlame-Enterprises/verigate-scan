@@ -35,6 +35,9 @@ jest.mock('../DatabaseService', () => ({
     getUserByEmail: jest.fn(async () => undefined),
   },
 }));
+jest.mock('../DeviceIdentityService', () => ({
+  DeviceIdentityService: { getInstallationId: jest.fn(async () => 'scan-installation') },
+}));
 
 import { ApiClient, ApiError } from '../ApiClient';
 import { DatabaseService } from '../DatabaseService';

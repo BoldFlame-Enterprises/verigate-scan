@@ -25,6 +25,9 @@ jest.mock('../ApiClient', () => ({
 jest.mock('../OfflineSessionService', () => ({
   OfflineSessionService: { refreshProductionBinding: jest.fn(async () => undefined) },
 }));
+jest.mock('../DeviceIdentityService', () => ({
+  DeviceIdentityService: { getInstallationId: jest.fn(async () => 'scan-installation') },
+}));
 jest.mock('../DatabaseService', () => ({
   DatabaseService: {
     upsertSyncedUsers: jest.fn(async () => undefined),
@@ -72,7 +75,7 @@ describe('SyncService', () => {
     expect(DatabaseService.setQrAuthorityPublicKey).toHaveBeenCalledWith(6, 'authority-key');
     expect(OfflineSessionService.refreshProductionBinding).toHaveBeenCalledWith({
       eventId: 6,
-      deviceId: 'scan-device',
+      deviceId: 'scan-installation',
       tokenBinding: 'token-family-1',
     });
   });

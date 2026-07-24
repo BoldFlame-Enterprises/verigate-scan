@@ -200,6 +200,60 @@ describe('DatabaseService event-scoped users', () => {
     expect(migrationSql.some((sql) => sql.includes('DELETE FROM overrides_queue'))).toBe(false);
   });
 
+  it('device-qualifies only unsynced null or weak legacy queue identities', async () => {
+    const database = createDatabaseDouble();
+    database.getAllAsync.mockImplementation(async (sql) => {
+      if (sql.includes('PRAGMA table_info(users)')) {
+        return [
+          { name: 'event_id', notnull: 1, pk: 1 },
+          { name: 'id', notnull: 1, pk: 2 },
+          { name: 'assignments', notnull: 1, pk: 0 },
+        ];
+      }
+      return [
+        { name: 'client_record_id' },
+        { name: 'occurred_at' },
+        { name: 'attempt_count' },
+        { name: 'last_attempt_at' },
+        { name: 'last_error' },
+        { name: 'terminal_failure' },
+      ];
+    });
+    service.database = database;
+
+    await service.createTables();
+
+    const incidentMigration = database.runAsync.mock.calls.find(([sql]) =>
+      sql.includes('UPDATE incidents_queue') && sql.includes('legacy-incident-')
+    );
+    const overrideMigration = database.runAsync.mock.calls.find(([sql]) =>
+      sql.includes('UPDATE overrides_queue') && sql.includes('legacy-override-')
+    );
+    expect(compact(incidentMigration?.[0] ?? '')).toContain(
+      "WHERE synced = 0 AND (client_record_id IS NULL OR client_record_id = 'legacy-incident-' || id)"
+    );
+    expect(compact(overrideMigration?.[0] ?? '')).toContain(
+      "WHERE synced = 0 AND (client_record_id IS NULL OR client_record_id = 'legacy-override-' || id)"
+    );
+    expect(incidentMigration?.[1]).toEqual(['legacy-incident-scan-record-id-']);
+    expect(overrideMigration?.[1]).toEqual(['legacy-override-scan-record-id-']);
+  });
+
+  it('keeps new incident and override records on random UUID identities', async () => {
+    const database = createDatabaseDouble();
+    service.database = database;
+    const randomUUID = jest.requireMock('expo-crypto').randomUUID as jest.Mock;
+    randomUUID
+      .mockReturnValueOnce('new-incident-uuid')
+      .mockReturnValueOnce('new-override-uuid');
+
+    await DatabaseService.queueIncident(4, 'security', 'New incident');
+    await DatabaseService.queueOverride(4, 'Arena', true, 'New override');
+
+    expect(database.runAsync.mock.calls[0][1]?.[0]).toBe('new-incident-uuid');
+    expect(database.runAsync.mock.calls[1][1]?.[0]).toBe('new-override-uuid');
+  });
+
   it('reads bounded non-terminal queue rows and stores bounded failure metadata', async () => {
     const database = createDatabaseDouble();
     database.getAllAsync

@@ -14,6 +14,7 @@ The mobile app scanners/staff use to verify attendee QR codes offline against a 
 - **Foreground event sync**: production login authenticates against the backend, pulls complete user/area snapshots, retains complete per-area assignments and the trusted event QR authority, and uploads each queue under its immutable originating event. The foreground scheduler uses a nominal 10-second cadence with bounded backoff/jitter; background execution is unsupported and manual feedback remains available. Blank-password local data is available only when `EXPO_PUBLIC_DEMO_MODE=true`.
 
 - **Durable queue acknowledgements**: scans, incidents, and overrides preserve client record IDs, originating events, payloads, and occurrence times. Incident/override uploads process at most two batches of ten per foreground cycle. Accepted/known-duplicate records become synced, structured terminal rejections remain retained with bounded error metadata, and authentication/transient failures remain pending and stop safely.
+- **Installation-qualified legacy identities**: one SecureStore-backed installation identity is shared by heartbeat and migration of pending rows that never received a client identity. It remains stable across restarts; newly queued records continue to use random UUIDs. A build that finds an already-assigned weak `legacy-incident-<row>` or `legacy-override-<row>` identity stops before changing it because a lost upload acknowledgement cannot be distinguished locally from a never-uploaded row.
 - **Sync-stale local warning**: a local notification (`expo-notifications`) fires if the device hasn't synced recently - there is no remote push in this app by design (scanners are expected to be actively at the device).
 
 ## 🛠️ Tech Stack (as actually built)
@@ -23,7 +24,7 @@ This is an **Expo (SDK 53) app**, not a bare React Native CLI project, and it us
 - Expo Router (file-based navigation), TypeScript
 - `expo-camera` for QR scanning
 - `expo-sqlite`'s API surface, but backed by **`@op-engineering/op-sqlite` compiled with SQLCipher** for genuine at-rest database encryption (see below) - not plain `expo-sqlite`
-- `expo-secure-store`, `expo-crypto`, `expo-av`, `expo-notifications`, `expo-application`
+- `expo-secure-store`, `expo-crypto`, `expo-av`, `expo-notifications`
 
 ## 🔒 Local database encryption
 
@@ -55,3 +56,8 @@ Private local EAS/signing/provider files such as `credentials.json`, `*.jks`, `*
 ## Validation boundary
 
 Repository release evidence covers signed Android cloud build/publication for an exact source revision. It does not prove installation, physical camera/biometric/SQLCipher behavior, offline recovery after process kill, two-device replay handling, or any iOS behavior. Scan intentionally implements only local sync-stale notifications; logout cancels the session-local warning before authentication state is cleared.
+
+Do not release the installation-identity migration until the deployed Scan
+inventory and the lost-ack reconciliation policy are approved with compatible
+backend behavior. Follow the aggregate repository's
+`docs/database-operations.md` rollout gate.

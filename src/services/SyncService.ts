@@ -1,6 +1,4 @@
 import * as SecureStore from 'expo-secure-store';
-import * as Application from 'expo-application';
-import * as Crypto from 'expo-crypto';
 import { Platform } from 'react-native';
 import { ApiClient, ApiError } from './ApiClient';
 import { DatabaseService, User } from './DatabaseService';
@@ -11,11 +9,11 @@ import {
   SCAN_UPLOAD_MAX_BATCHES_PER_SYNC,
 } from '../config';
 import { OfflineSessionService } from './OfflineSessionService';
+import { DeviceIdentityService } from './DeviceIdentityService';
 
 const CURRENT_EVENT_ID_KEY = 'verigate_scan_event_id';
 const CURRENT_EVENT_NAME_KEY = 'verigate_scan_event_name';
 const LAST_SYNC_AT_KEY = 'verigate_scan_last_sync_at';
-const FALLBACK_DEVICE_ID_KEY = 'verigate_scan_fallback_device_id';
 
 interface RemoteEvent {
   id: number;
@@ -71,24 +69,10 @@ async function withBackoff<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
 }
 
 class SyncServiceClass {
-  private deviceId: string | null = null;
   private inFlight: Promise<SyncResult> | null = null;
 
   async getDeviceId(): Promise<string> {
-    if (this.deviceId) return this.deviceId;
-    const platformId = Platform.OS === 'android'
-      ? Application.getAndroidId()
-      : await Application.getIosIdForVendorAsync();
-    if (platformId) {
-      this.deviceId = platformId;
-      return this.deviceId;
-    }
-    this.deviceId = await SecureStore.getItemAsync(FALLBACK_DEVICE_ID_KEY);
-    if (!this.deviceId) {
-      this.deviceId = `scan-${Crypto.randomUUID()}`;
-      await SecureStore.setItemAsync(FALLBACK_DEVICE_ID_KEY, this.deviceId);
-    }
-    return this.deviceId;
+    return DeviceIdentityService.getInstallationId();
   }
 
   async getCurrentEventId(): Promise<number | null> {

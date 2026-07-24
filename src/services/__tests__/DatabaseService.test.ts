@@ -200,7 +200,7 @@ describe('DatabaseService event-scoped users', () => {
     expect(migrationSql.some((sql) => sql.includes('DELETE FROM overrides_queue'))).toBe(false);
   });
 
-  it('device-qualifies only unsynced null or weak legacy queue identities', async () => {
+  it('device-qualifies only unsynced queue rows that never received an identity', async () => {
     const database = createDatabaseDouble();
     database.getAllAsync.mockImplementation(async (sql) => {
       if (sql.includes('PRAGMA table_info(users)')) {
@@ -224,19 +224,55 @@ describe('DatabaseService event-scoped users', () => {
     await service.createTables();
 
     const incidentMigration = database.runAsync.mock.calls.find(([sql]) =>
-      sql.includes('UPDATE incidents_queue') && sql.includes('legacy-incident-')
+      sql.includes('UPDATE incidents_queue')
     );
     const overrideMigration = database.runAsync.mock.calls.find(([sql]) =>
-      sql.includes('UPDATE overrides_queue') && sql.includes('legacy-override-')
+      sql.includes('UPDATE overrides_queue')
     );
     expect(compact(incidentMigration?.[0] ?? '')).toContain(
-      "WHERE synced = 0 AND (client_record_id IS NULL OR client_record_id = 'legacy-incident-' || id)"
+      'WHERE synced = 0 AND client_record_id IS NULL'
     );
     expect(compact(overrideMigration?.[0] ?? '')).toContain(
-      "WHERE synced = 0 AND (client_record_id IS NULL OR client_record_id = 'legacy-override-' || id)"
+      'WHERE synced = 0 AND client_record_id IS NULL'
     );
     expect(incidentMigration?.[1]).toEqual(['legacy-incident-scan-record-id-']);
     expect(overrideMigration?.[1]).toEqual(['legacy-override-scan-record-id-']);
+  });
+
+  it('stops before changing weak identities until lost acknowledgements have an approved reconciliation', async () => {
+    const database = createDatabaseDouble();
+    database.getAllAsync.mockImplementation(async (sql) => {
+      if (sql.includes('PRAGMA table_info(users)')) {
+        return [
+          { name: 'event_id', notnull: 1, pk: 1 },
+          { name: 'id', notnull: 1, pk: 2 },
+          { name: 'assignments', notnull: 1, pk: 0 },
+        ];
+      }
+      return [
+        { name: 'client_record_id' },
+        { name: 'occurred_at' },
+        { name: 'attempt_count' },
+        { name: 'last_attempt_at' },
+        { name: 'last_error' },
+        { name: 'terminal_failure' },
+      ];
+    });
+    database.getFirstAsync.mockImplementation(async (sql) => (
+      sql.includes("client_record_id = 'legacy-incident-' || id")
+        ? { incident_count: 1, override_count: 0 }
+        : null
+    ));
+    service.database = database;
+
+    await expect(service.createTables()).rejects.toThrow(
+      'Legacy queue reconciliation approval is required'
+    );
+
+    expect(database.runAsync).not.toHaveBeenCalledWith(
+      expect.stringContaining('UPDATE incidents_queue'),
+      expect.anything()
+    );
   });
 
   it('keeps new incident and override records on random UUID identities', async () => {

@@ -3,6 +3,10 @@ import * as Crypto from 'expo-crypto';
 import * as SecureStore from 'expo-secure-store';
 import { DEMO_MODE } from '../config';
 import { CredentialAssignment, QrCredentialService } from './QrCredentialService';
+import {
+  DeviceIdentityService,
+  legacyQueueRecordPrefix,
+} from './DeviceIdentityService';
 
 export interface User {
   id: number;
@@ -294,13 +298,44 @@ class DatabaseServiceClass {
     await this.addColumnIfMissing('overrides_queue', 'last_attempt_at', 'TEXT');
     await this.addColumnIfMissing('overrides_queue', 'last_error', 'TEXT');
     await this.addColumnIfMissing('overrides_queue', 'terminal_failure', 'INTEGER NOT NULL DEFAULT 0');
+    const unresolvedLegacyIdentities = await this.database.getFirstAsync(
+      `SELECT
+         (SELECT COUNT(*) FROM incidents_queue
+          WHERE synced = 0
+            AND client_record_id = 'legacy-incident-' || id) AS incident_count,
+         (SELECT COUNT(*) FROM overrides_queue
+          WHERE synced = 0
+            AND client_record_id = 'legacy-override-' || id) AS override_count`
+    ) as { incident_count: number; override_count: number } | null;
+    if (
+      (unresolvedLegacyIdentities?.incident_count ?? 0) > 0 ||
+      (unresolvedLegacyIdentities?.override_count ?? 0) > 0
+    ) {
+      throw new Error(
+        'Legacy queue reconciliation approval is required before changing previously assigned record identities'
+      );
+    }
+
+    const installationId = await DeviceIdentityService.getInstallationId();
+    await this.database.runAsync(
+      `UPDATE incidents_queue
+       SET client_record_id = ? || id
+       WHERE synced = 0
+         AND client_record_id IS NULL`,
+      [legacyQueueRecordPrefix('incident', installationId)]
+    );
+    await this.database.runAsync(
+      `UPDATE overrides_queue
+       SET client_record_id = ? || id
+       WHERE synced = 0
+         AND client_record_id IS NULL`,
+      [legacyQueueRecordPrefix('override', installationId)]
+    );
     await this.database.execAsync(`
       UPDATE incidents_queue
-      SET client_record_id = COALESCE(client_record_id, 'legacy-incident-' || id),
-          occurred_at = COALESCE(occurred_at, created_at);
+      SET occurred_at = COALESCE(occurred_at, created_at);
       UPDATE overrides_queue
-      SET client_record_id = COALESCE(client_record_id, 'legacy-override-' || id),
-          occurred_at = COALESCE(occurred_at, created_at);
+      SET occurred_at = COALESCE(occurred_at, created_at);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_queue_client_record
         ON incidents_queue(client_record_id);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_overrides_queue_client_record

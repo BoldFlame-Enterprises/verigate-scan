@@ -107,4 +107,50 @@ describe('ApiClient token binding', () => {
       expect((error as ApiError).responseData).not.toHaveProperty('refreshToken');
     }
   });
+
+  it('exchanges the account session for a Scan registration bound to the existing installation', async () => {
+    jest.mocked(global.fetch)
+      .mockResolvedValueOnce(response(200, {
+        success: true,
+        data: {
+          user: { id: 2, email: 'scanner@example.com', name: 'Scanner', phone: '1', role: 'scanner', is_active: true },
+          accessToken: 'account-access',
+          refreshToken: 'account-refresh',
+        },
+      }) as never)
+      .mockResolvedValueOnce(response(200, {
+        success: true,
+        data: {
+          registration: {
+            id: 41,
+            event_id: 7,
+            app: 'scan',
+            installation_id: 'scan-installation',
+            state: 'active',
+            session_generation: 3,
+            version: 4,
+          },
+          accessToken: 'device-access',
+          refreshToken: 'device-refresh',
+        },
+      }) as never);
+
+    await ApiClient.login('scanner@example.com', 'password');
+    const registration = await ApiClient.registerDeviceSession(7, 'scan-installation', 'android');
+
+    expect(registration).toMatchObject({ id: 41, event_id: 7, app: 'scan' });
+    expect(ApiClient.hasDeviceSession()).toBe(true);
+    expect(jest.mocked(global.fetch).mock.calls[1]).toEqual([
+      'https://api.example.test/devices/session',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          event_id: 7,
+          app: 'scan',
+          installation_id: 'scan-installation',
+          platform: 'android',
+        }),
+      }),
+    ]);
+  });
 });

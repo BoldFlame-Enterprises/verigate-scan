@@ -20,7 +20,7 @@ jest.mock('../ApiClient', () => ({
       this.responseData = mockResponseData;
     }
   },
-  ApiClient: { isAuthenticated: jest.fn(() => true), request: jest.fn() },
+  ApiClient: { isAuthenticated: jest.fn(() => true), request: jest.fn(), auditRequest: jest.fn() },
 }));
 jest.mock('../DatabaseService', () => ({
   DatabaseService: {
@@ -33,6 +33,9 @@ jest.mock('../DatabaseService', () => ({
     markOverridesSynced: jest.fn(async () => undefined),
     recordOverrideFailure: jest.fn(async () => undefined),
     getUserByEmail: jest.fn(async () => undefined),
+    getEligibleAuditScanLogs: jest.fn(async () => []),
+    getEligibleAuditIncidents: jest.fn(async () => []),
+    getEligibleAuditOverrides: jest.fn(async () => []),
   },
 }));
 jest.mock('../DeviceIdentityService', () => ({
@@ -343,5 +346,53 @@ describe('incident and override upload queues', () => {
     expect(DatabaseService.getUnsyncedOverrides).toHaveBeenCalledWith(10);
     expect(ApiClient.request).toHaveBeenCalledTimes(20);
     expect((jest.mocked(ApiClient.request).mock.calls[19][1] as any).body.event_id).toBe(61);
+  });
+});
+
+describe('deregistered audit queue', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.mocked(DatabaseService.getEligibleAuditScanLogs).mockResolvedValue([]);
+    jest.mocked(DatabaseService.getEligibleAuditIncidents).mockResolvedValue([]);
+    jest.mocked(DatabaseService.getEligibleAuditOverrides).mockResolvedValue([]);
+  });
+
+  it('selects only records at or before the deregistration cutoff and acknowledges idempotently', async () => {
+    jest.mocked(DatabaseService.getEligibleAuditScanLogs).mockResolvedValue([record(1, 4)]);
+    jest.mocked(ApiClient.auditRequest).mockResolvedValue({
+      contract_version: 'queue-ack-v2',
+      results: [{ client_record_id: 'scan-1', status: 'duplicate' }],
+    } as never);
+
+    await (SyncService as any).drainDeregisteredAuditQueues({
+      cutoff: '2026-07-27T12:00:00.000Z',
+      deadline: '2026-07-27T12:15:00.000Z',
+      accessToken: 'audit-token',
+    });
+
+    expect(DatabaseService.getEligibleAuditScanLogs).toHaveBeenCalledWith(
+      '2026-07-27T12:00:00.000Z',
+      25
+    );
+    expect(ApiClient.auditRequest).toHaveBeenCalledWith(
+      'audit-token',
+      '/sync/scan-logs',
+      expect.objectContaining({ method: 'POST' })
+    );
+    expect(DatabaseService.markScanLogsSynced).toHaveBeenCalledWith([1]);
+  });
+
+  it('does not begin an audit upload after the deadline', async () => {
+    jest.spyOn(Date, 'now').mockReturnValue(new Date('2026-07-27T12:15:00.001Z').getTime());
+
+    await (SyncService as any).drainDeregisteredAuditQueues({
+      cutoff: '2026-07-27T12:00:00.000Z',
+      deadline: '2026-07-27T12:15:00.000Z',
+      accessToken: 'audit-token',
+    });
+
+    expect(DatabaseService.getEligibleAuditScanLogs).not.toHaveBeenCalled();
+    expect(ApiClient.auditRequest).not.toHaveBeenCalled();
+    jest.restoreAllMocks();
   });
 });

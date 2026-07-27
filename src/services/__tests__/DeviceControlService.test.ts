@@ -9,6 +9,7 @@ jest.mock('expo-secure-store', () => ({
 jest.mock('../ApiClient', () => ({
   ApiClient: {
     isAuthenticated: jest.fn(() => true),
+    hasDeviceSession: jest.fn(() => true),
     getDeviceState: jest.fn(),
     obtainAuditCredential: jest.fn(),
     clearTokens: jest.fn(async () => undefined),
@@ -17,7 +18,7 @@ jest.mock('../ApiClient', () => ({
   ApiError: class ApiError extends Error {
     statusCode: number;
     code?: string;
-    constructor(statusCode: number, message: string, code?: string) {
+    constructor(statusCode: number, message: string, _responseData?: unknown, code?: string) {
       super(message);
       this.statusCode = statusCode;
       this.code = code;
@@ -53,7 +54,7 @@ describe('Scan connected device enforcement', () => {
 
   it('stops scanning and drains only through the bounded audit credential after deregistration', async () => {
     jest.mocked(ApiClient.getDeviceState).mockRejectedValue(
-      new ApiError(401, 'Registration revoked', 'DEVICE_DEREGISTERED')
+      new ApiError(401, 'Registration revoked', undefined, 'DEVICE_DEREGISTERED')
     );
     jest.mocked(ApiClient.obtainAuditCredential).mockResolvedValue({
       accessToken: 'audit-token',
@@ -80,7 +81,7 @@ describe('Scan connected device enforcement', () => {
 
   it('performs zero final upload after blacklisting and keeps a login notice outside auth state', async () => {
     jest.mocked(ApiClient.getDeviceState).mockRejectedValue(
-      new ApiError(401, 'Registration blocked', 'DEVICE_BLACKLISTED')
+      new ApiError(401, 'Registration blocked', undefined, 'DEVICE_BLACKLISTED')
     );
 
     await DeviceControlService.checkConnectedState();

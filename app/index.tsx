@@ -7,6 +7,7 @@ import { OfflineSessionService } from '@/services/OfflineSessionService';
 import { ApiClient } from '@/services/ApiClient';
 import { SyncService } from '@/services/SyncService';
 import { DEMO_MODE } from '@/config';
+import { DeviceControlService } from '@/services/DeviceControlService';
 
 export default function IndexScreen() {
   const [isLoading, setIsLoading] = useState(true);
@@ -18,6 +19,10 @@ export default function IndexScreen() {
       try {
         const storedEmail = await DatabaseService.getStoredScannerEmail();
         await ApiClient.loadTokens();
+        if (ApiClient.hasDeviceSession()) {
+          const state = await DeviceControlService.checkConnectedState();
+          if (state.status === 'revoked') return;
+        }
         const metadata = storedEmail ? await OfflineSessionService.getMetadata(storedEmail) : null;
         const scanner = metadata
           ? await DatabaseService.getScannerUserByEmail(metadata.email)

@@ -15,6 +15,7 @@ interface AppStateSource {
 
 interface SchedulerCallbacks {
   onSuccess?: (result: SyncResult) => void | Promise<void>;
+  onDeviceControl?: (reason: 'deregistered' | 'blacklisted') => void | Promise<void>;
 }
 
 export class ForegroundSyncScheduler {
@@ -77,6 +78,16 @@ export class ForegroundSyncScheduler {
         this.consecutiveFailures = result.success ? 0 : this.consecutiveFailures + 1;
         if (result.success && this.running && lifecycle === this.lifecycle && this.activeState === 'active') {
           await Promise.resolve(this.callbacks.onSuccess?.(result)).catch(() => undefined);
+        }
+        if (
+          result.deviceControlReason
+          && this.running
+          && lifecycle === this.lifecycle
+          && this.activeState === 'active'
+        ) {
+          await Promise.resolve(
+            this.callbacks.onDeviceControl?.(result.deviceControlReason)
+          ).catch(() => undefined);
         }
         return result;
       })

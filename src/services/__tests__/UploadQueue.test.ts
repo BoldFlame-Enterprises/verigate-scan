@@ -352,9 +352,14 @@ describe('incident and override upload queues', () => {
 describe('deregistered audit queue', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    jest.spyOn(Date, 'now').mockReturnValue(new Date('2026-07-27T12:05:00.000Z').getTime());
     jest.mocked(DatabaseService.getEligibleAuditScanLogs).mockResolvedValue([]);
     jest.mocked(DatabaseService.getEligibleAuditIncidents).mockResolvedValue([]);
     jest.mocked(DatabaseService.getEligibleAuditOverrides).mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
   });
 
   it('selects only records at or before the deregistration cutoff and acknowledges idempotently', async () => {
@@ -383,7 +388,7 @@ describe('deregistered audit queue', () => {
   });
 
   it('does not begin an audit upload after the deadline', async () => {
-    jest.spyOn(Date, 'now').mockReturnValue(new Date('2026-07-27T12:15:00.001Z').getTime());
+    jest.mocked(Date.now).mockReturnValue(new Date('2026-07-27T12:15:00.001Z').getTime());
 
     await (SyncService as any).drainDeregisteredAuditQueues({
       cutoff: '2026-07-27T12:00:00.000Z',
@@ -393,6 +398,5 @@ describe('deregistered audit queue', () => {
 
     expect(DatabaseService.getEligibleAuditScanLogs).not.toHaveBeenCalled();
     expect(ApiClient.auditRequest).not.toHaveBeenCalled();
-    jest.restoreAllMocks();
   });
 });

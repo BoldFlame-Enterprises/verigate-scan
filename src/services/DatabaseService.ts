@@ -75,6 +75,7 @@ export interface QueuedOverride {
 }
 
 const MAX_QUEUE_ERROR_LENGTH = 500;
+const DEVICE_CONTROL_STATE_KEY = 'verigate_scan_device_control_state';
 
 class DatabaseServiceClass {
   private database: SQLite.SQLiteDatabase | null = null;
@@ -657,6 +658,7 @@ class DatabaseServiceClass {
       throw new Error('Database not initialized');
     }
 
+    await this.assertRecordingAuthority();
     const deviceScanId = scanLog.device_scan_id ?? Crypto.randomUUID();
 
     await this.database.runAsync(
@@ -806,6 +808,27 @@ class DatabaseServiceClass {
     }));
   }
 
+  async getEligibleAuditScanLogs(cutoff: string, limit = 25): Promise<(ScanLog & { id: number })[]> {
+    if (!this.database) throw new Error('Database not initialized');
+    const rows = (await this.database.getAllAsync(
+      'SELECT * FROM scan_logs WHERE synced = 0 AND scanned_at <= ? ORDER BY id ASC LIMIT ?',
+      [cutoff, limit]
+    )) as any[];
+    return rows.map((row) => ({
+      id: row.id,
+      user_id: row.user_id,
+      event_id: row.event_id,
+      user_name: row.user_name,
+      area: row.area,
+      area_id: row.area_id,
+      access_granted: row.access_granted === 1,
+      failure_reason: row.failure_reason,
+      scanned_at: row.scanned_at,
+      scanner_user: row.scanner_user,
+      device_scan_id: row.device_scan_id,
+    }));
+  }
+
   async markScanLogsSynced(ids: number[]): Promise<void> {
     if (!this.database || ids.length === 0) return;
     const placeholders = ids.map(() => '?').join(',');
@@ -814,6 +837,7 @@ class DatabaseServiceClass {
 
   async queueIncident(eventId: number, category: string, description: string, area?: string, areaId?: number): Promise<void> {
     if (!this.database) throw new Error('Database not initialized');
+    await this.assertRecordingAuthority();
     const clientRecordId = Crypto.randomUUID();
     const occurredAt = new Date().toISOString();
     await this.database.runAsync(
@@ -829,6 +853,17 @@ class DatabaseServiceClass {
     const rows = (await this.database.getAllAsync(
       'SELECT * FROM incidents_queue WHERE synced = 0 AND terminal_failure = 0 ORDER BY id ASC LIMIT ?',
       [limit]
+    )) as any[];
+    return rows.map((row) => ({ ...row, terminal_failure: row.terminal_failure === 1 }));
+  }
+
+  async getEligibleAuditIncidents(cutoff: string, limit: number): Promise<QueuedIncident[]> {
+    if (!this.database) throw new Error('Database not initialized');
+    const rows = (await this.database.getAllAsync(
+      `SELECT * FROM incidents_queue
+       WHERE synced = 0 AND terminal_failure = 0 AND occurred_at <= ?
+       ORDER BY id ASC LIMIT ?`,
+      [cutoff, limit]
     )) as any[];
     return rows.map((row) => ({ ...row, terminal_failure: row.terminal_failure === 1 }));
   }
@@ -857,6 +892,7 @@ class DatabaseServiceClass {
     areaId?: number
   ): Promise<void> {
     if (!this.database) throw new Error('Database not initialized');
+    await this.assertRecordingAuthority();
     const clientRecordId = Crypto.randomUUID();
     const occurredAt = new Date().toISOString();
     await this.database.runAsync(
@@ -872,6 +908,21 @@ class DatabaseServiceClass {
     const rows = (await this.database.getAllAsync(
       'SELECT * FROM overrides_queue WHERE synced = 0 AND terminal_failure = 0 ORDER BY id ASC LIMIT ?',
       [limit]
+    )) as any[];
+    return rows.map((row) => ({
+      ...row,
+      access_granted: row.access_granted === 1,
+      terminal_failure: row.terminal_failure === 1,
+    }));
+  }
+
+  async getEligibleAuditOverrides(cutoff: string, limit: number): Promise<QueuedOverride[]> {
+    if (!this.database) throw new Error('Database not initialized');
+    const rows = (await this.database.getAllAsync(
+      `SELECT * FROM overrides_queue
+       WHERE synced = 0 AND terminal_failure = 0 AND occurred_at <= ?
+       ORDER BY id ASC LIMIT ?`,
+      [cutoff, limit]
     )) as any[];
     return rows.map((row) => ({
       ...row,
@@ -1064,6 +1115,13 @@ class DatabaseServiceClass {
       await SecureStore.deleteItemAsync('scanner_last_login');
     } catch (error) {
       console.error('Error clearing scanner credentials:', error);
+    }
+  }
+
+  private async assertRecordingAuthority(): Promise<void> {
+    const revoked = await SecureStore.getItemAsync(DEVICE_CONTROL_STATE_KEY);
+    if (revoked) {
+      throw new Error('This Scan installation is no longer registered for recording.');
     }
   }
 }

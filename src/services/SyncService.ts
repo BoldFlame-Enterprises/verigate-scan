@@ -29,6 +29,13 @@ export interface SyncResult {
   areaCount?: number;
   uploadedScans?: number;
   error?: string;
+  deviceControlReason?: 'deregistered' | 'blacklisted';
+}
+
+export interface DeregisteredAuditSession {
+  cutoff: string;
+  deadline: string;
+  accessToken: string;
 }
 
 interface QueueAckResponse {
@@ -181,8 +188,148 @@ class SyncServiceClass {
         uploadedScans,
       };
     } catch (error) {
-      return { success: false, error: error instanceof Error ? error.message : 'Sync failed' };
+      const deviceControlReason = error instanceof ApiError
+        ? (
+          error.code === 'DEVICE_BLACKLISTED'
+            ? 'blacklisted'
+            : error.code?.startsWith('DEVICE_') ? 'deregistered' : undefined
+        )
+        : undefined;
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Sync failed',
+        deviceControlReason,
+      };
     }
+  }
+
+  async drainDeregisteredAuditQueues(
+    session: DeregisteredAuditSession
+  ): Promise<{ uploaded: number }> {
+    if (Date.now() >= new Date(session.deadline).getTime()) return { uploaded: 0 };
+    let uploaded = await this.uploadEligibleAuditScans(session);
+    if (Date.now() < new Date(session.deadline).getTime()) {
+      uploaded += await this.uploadEligibleAuditIncidents(session);
+    }
+    if (Date.now() < new Date(session.deadline).getTime()) {
+      uploaded += await this.uploadEligibleAuditOverrides(session);
+    }
+    return { uploaded };
+  }
+
+  private async uploadEligibleAuditScans(session: DeregisteredAuditSession): Promise<number> {
+    const records = await DatabaseService.getEligibleAuditScanLogs(session.cutoff, SCAN_UPLOAD_BATCH_SIZE);
+    if (records.length === 0) return 0;
+    const groups = new Map<number, typeof records>();
+    records.forEach((record) => {
+      const group = groups.get(record.event_id) ?? [];
+      group.push(record);
+      groups.set(record.event_id, group);
+    });
+    const deviceId = await this.getDeviceId();
+    let uploaded = 0;
+    for (const [eventId, group] of groups) {
+      if (Date.now() >= new Date(session.deadline).getTime()) break;
+      const response = await ApiClient.auditRequest<QueueAckResponse>(
+        session.accessToken,
+        '/sync/scan-logs',
+        {
+          method: 'POST',
+          body: {
+            device_id: deviceId,
+            event_id: eventId,
+            logs: group.map((record) => ({
+              client_record_id: record.device_scan_id,
+              event_id: record.event_id,
+              user_id: record.user_id,
+              area_id: record.area_id,
+              access_granted: record.access_granted,
+              failure_reason: record.failure_reason,
+              scanned_at: record.scanned_at,
+              device_scan_id: record.device_scan_id,
+            })),
+          },
+        }
+      );
+      const acknowledged = new Set(
+        response.results
+          .filter((item) => item.status === 'accepted' || item.status === 'duplicate')
+          .map((item) => item.client_record_id)
+      );
+      const ids = group
+        .filter((record) => record.device_scan_id && acknowledged.has(record.device_scan_id))
+        .map((record) => record.id);
+      await DatabaseService.markScanLogsSynced(ids);
+      uploaded += ids.length;
+    }
+    return uploaded;
+  }
+
+  private async uploadEligibleAuditIncidents(session: DeregisteredAuditSession): Promise<number> {
+    const records = await DatabaseService.getEligibleAuditIncidents(
+      session.cutoff,
+      AUXILIARY_UPLOAD_BATCH_SIZE
+    );
+    let uploaded = 0;
+    for (const record of records) {
+      if (Date.now() >= new Date(session.deadline).getTime()) break;
+      const response = await ApiClient.auditRequest<RecordAckResponse>(
+        session.accessToken,
+        '/incidents',
+        {
+          method: 'POST',
+          body: {
+            client_record_id: record.client_record_id,
+            event_id: record.event_id,
+            category: record.category,
+            description: record.description,
+            area_id: record.area_id ?? undefined,
+            occurred_at: record.occurred_at,
+          },
+        }
+      );
+      if (this.isAcceptedAcknowledgement(response, record.client_record_id)) {
+        await DatabaseService.markIncidentsSynced([record.id]);
+        uploaded += 1;
+      }
+    }
+    return uploaded;
+  }
+
+  private async uploadEligibleAuditOverrides(session: DeregisteredAuditSession): Promise<number> {
+    const records = await DatabaseService.getEligibleAuditOverrides(
+      session.cutoff,
+      AUXILIARY_UPLOAD_BATCH_SIZE
+    );
+    let uploaded = 0;
+    for (const record of records) {
+      if (Date.now() >= new Date(session.deadline).getTime()) break;
+      if (!record.area_id) continue;
+      const user = record.user_email
+        ? await DatabaseService.getUserByEmail(record.user_email, record.event_id)
+        : undefined;
+      const response = await ApiClient.auditRequest<RecordAckResponse>(
+        session.accessToken,
+        '/incidents/overrides',
+        {
+          method: 'POST',
+          body: {
+            client_record_id: record.client_record_id,
+            event_id: record.event_id,
+            area_id: record.area_id,
+            access_granted: record.access_granted,
+            reason: record.reason,
+            user_id: user?.id,
+            occurred_at: record.occurred_at,
+          },
+        }
+      );
+      if (this.isAcceptedAcknowledgement(response, record.client_record_id)) {
+        await DatabaseService.markOverridesSynced([record.id]);
+        uploaded += 1;
+      }
+    }
+    return uploaded;
   }
 
   private async uploadQueuedScans(): Promise<number> {

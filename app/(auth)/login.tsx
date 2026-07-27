@@ -18,6 +18,7 @@ import { ApiClient } from '@/services/ApiClient';
 import { SyncService } from '@/services/SyncService';
 import { OfflineSessionService } from '@/services/OfflineSessionService';
 import { DEMO_MODE } from '@/config';
+import { DeviceControlService } from '@/services/DeviceControlService';
 
 export default function LoginScreen() {
   const [email, setEmail] = useState('');
@@ -51,6 +52,8 @@ export default function LoginScreen() {
         }
 
         await ApiClient.loadTokens();
+        const notice = await DeviceControlService.consumeNotice();
+        if (notice) Alert.alert('Device registration changed', notice.message);
 
         console.log('✅ Loaded scanner data from encrypted database:', {
           scannerCount: users.length,
@@ -88,6 +91,20 @@ export default function LoginScreen() {
           await ApiClient.clearTokens();
           throw new Error('This account is not authorized to use VeriGate Scan');
         }
+        const events = await ApiClient.request<{ id: number; name: string }[]>('/events');
+        if (events.length === 0) {
+          await ApiClient.clearTokens();
+          throw new Error('No events assigned to this scanner account yet');
+        }
+        const previousEventId = await SyncService.getCurrentEventId();
+        const selectedEvent = events.find((event) => event.id === previousEventId) ?? events[0];
+        const installationId = await SyncService.getDeviceId();
+        await ApiClient.registerDeviceSession(
+          selectedEvent.id,
+          installationId,
+          Platform.OS === 'ios' ? 'ios' : 'android'
+        );
+        await DeviceControlService.clearRevocationMarker();
         const syncResult = await SyncService.syncNow();
         if (!syncResult.success || !syncResult.eventId) {
           await ApiClient.clearTokens();

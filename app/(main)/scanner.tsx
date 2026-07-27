@@ -7,6 +7,7 @@ import {
   Alert,
   ScrollView,
   Dimensions,
+  AppState,
   Modal,
   TextInput,
   Switch,
@@ -21,6 +22,7 @@ import { NotificationService } from '../../src/services/NotificationService';
 import { AudioFeedbackService } from '../../src/services/AudioFeedbackService';
 import { ApiClient } from '../../src/services/ApiClient';
 import { OfflineSessionService } from '../../src/services/OfflineSessionService';
+import { DeviceControlService } from '../../src/services/DeviceControlService';
 
 const { width } = Dimensions.get('window');
 
@@ -84,9 +86,27 @@ export default function ScannerScreen() {
   }, []);
 
   useEffect(() => {
+    const handleRevocation = async () => {
+      setIsScanning(false);
+      setScannerUser(null);
+      router.replace('/(auth)/login');
+    };
+    const unsubscribe = DeviceControlService.subscribe(() => handleRevocation());
+    const appState = AppState.addEventListener('change', (state) => {
+      if (state === 'active') void DeviceControlService.checkConnectedState();
+    });
+    void DeviceControlService.checkConnectedState();
+    return () => {
+      unsubscribe();
+      appState.remove();
+    };
+  }, [setScannerUser]);
+
+  useEffect(() => {
     if (!authenticatedScannerId || !ApiClient.isAuthenticated()) return;
     SyncScheduler.start({
       onSuccess: (result) => syncedStateRefreshRef.current(result),
+      onDeviceControl: (reason) => DeviceControlService.revoke(reason),
     });
     return () => SyncScheduler.stop();
   }, [authenticatedScannerId]);
@@ -96,6 +116,10 @@ export default function ScannerScreen() {
     try {
       const result = await SyncScheduler.syncNow();
       if (!mountedRef.current) return;
+      if (result.deviceControlReason) {
+        await DeviceControlService.revoke(result.deviceControlReason);
+        return;
+      }
       if (result.success) {
         Alert.alert('Synced', `${result.eventName}: ${result.userCount} users, ${result.areaCount} areas, ${result.uploadedScans} scans uploaded.`);
       } else {

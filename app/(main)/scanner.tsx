@@ -215,7 +215,7 @@ export default function ScannerScreen() {
             await NotificationService.cancelStaleWarning();
             await DatabaseService.clearScannerCredentials();
             await OfflineSessionService.clear();
-            await ApiClient.clearTokens();
+            await ApiClient.logout();
             setScannerUser(null);
             router.replace('/(auth)/login');
           },

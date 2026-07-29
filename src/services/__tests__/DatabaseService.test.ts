@@ -12,11 +12,14 @@ jest.mock('expo-crypto', () => ({
   randomUUID: jest.fn(() => 'record-id'),
 }));
 jest.mock('../../config', () => ({ DEMO_MODE: false }));
-jest.mock('../QrCredentialService', () => ({ QrCredentialService: {} }));
+jest.mock('../QrCredentialService', () => ({
+  QrCredentialService: { verify: jest.fn() },
+}));
 
 import * as SecureStore from 'expo-secure-store';
 import { DatabaseService, User } from '../DatabaseService';
 import { SQLiteDatabase } from '../EncryptedSQLite';
+import { QrCredentialService } from '../QrCredentialService';
 
 type DatabaseDouble = {
   execAsync: jest.Mock<Promise<void>, [string]>;
@@ -317,5 +320,55 @@ describe('DatabaseService event-scoped users', () => {
     expect((incidentFailure[1]?.[1] as string).length).toBe(500);
     expect(incidentFailure[1]?.slice(2)).toEqual([0, 1]);
     expect(database.runAsync.mock.calls[1][1]?.slice(2)).toEqual([1, 2]);
+  });
+
+  it('denies signed or local assignments whose active-resource projection is incomplete', async () => {
+    const now = Date.now();
+    const assignment = {
+      area_id: 3,
+      area_name: 'Main Arena',
+      access_level_id: 2,
+      access_level_name: 'VIP',
+      access_priority: 5,
+      valid_from: new Date(now - 60_000).toISOString(),
+      valid_until: new Date(now + 60_000).toISOString(),
+    };
+    for (const incompleteProjection of ['signed', 'local'] as const) {
+      const database = createDatabaseDouble();
+      database.getFirstAsync
+        .mockResolvedValueOnce({ qr_authority_public_key: 'trusted-key' })
+        .mockResolvedValueOnce({
+          ...user(5),
+          allowed_areas: '["Main Arena"]',
+          assignments: JSON.stringify([
+            incompleteProjection === 'local'
+              ? { ...assignment, access_level_id: null }
+              : assignment,
+          ]),
+          is_active: 1,
+        });
+      service.database = database;
+      (QrCredentialService.verify as jest.Mock).mockResolvedValueOnce({
+        valid: true,
+        presentation: {
+          user_id: 5,
+          email: 'same@example.com',
+          name: 'Event 5',
+          event_id: 5,
+          credential_id: 'credential-1',
+          nonce: 'nonce-1',
+          assignments: [
+            incompleteProjection === 'signed'
+              ? { ...assignment, access_level_id: null }
+              : assignment,
+          ],
+        },
+      });
+
+      await expect(DatabaseService.verifyQRCode('{}', 'Main Arena', 5)).resolves.toMatchObject({
+        success: false,
+        reason: 'No current access assignment for Main Arena',
+      });
+    }
   });
 });

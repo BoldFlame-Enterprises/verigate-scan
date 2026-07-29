@@ -20,6 +20,17 @@ export interface User {
   is_active: boolean;
 }
 
+function hasCompleteAccessResourceProjection(assignment: CredentialAssignment): boolean {
+  return Number.isInteger(assignment.area_id) &&
+    assignment.area_id > 0 &&
+    typeof assignment.area_name === 'string' &&
+    assignment.area_name.length > 0 &&
+    Number.isInteger(assignment.access_level_id) &&
+    assignment.access_level_id > 0 &&
+    typeof assignment.access_level_name === 'string' &&
+    assignment.access_level_name.length > 0;
+}
+
 export interface ScannerUser {
   id: number;
   email: string;
@@ -1038,11 +1049,13 @@ class DatabaseServiceClass {
 
       const now = Date.now();
       const signedAssignment = verification.presentation.assignments.find((assignment) =>
+        hasCompleteAccessResourceProjection(assignment) &&
         assignment.area_name === area &&
         new Date(assignment.valid_from).getTime() <= now &&
         new Date(assignment.valid_until).getTime() >= now
       );
       const localAssignment = (user.assignments ?? []).find((assignment) =>
+        hasCompleteAccessResourceProjection(assignment) &&
         assignment.area_id === signedAssignment?.area_id &&
         assignment.area_name === area &&
         new Date(assignment.valid_from).getTime() <= now &&

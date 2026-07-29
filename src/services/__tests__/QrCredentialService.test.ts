@@ -8,6 +8,7 @@ jest.mock('expo-crypto', () => ({
 }));
 
 import { QrCredentialService, QR_PROTOCOL_VERSION } from '../QrCredentialService';
+import qrV3Fixture from '../__fixtures__/qr-v3-contract.json';
 
 const SPKI_PREFIX = '3059301306072a8648ce3d020106082a8648ce3d030107034200';
 
@@ -75,5 +76,30 @@ describe('QrCredentialService', () => {
     const value = fixture();
     const result = await QrCredentialService.verify(value.encoded, 10, value.authorityPublicKey, 20_000);
     expect(result).toMatchObject({ valid: false, reason: 'QR belongs to a different event' });
+  });
+
+  it('shares the fixed compact v3 golden vector while keeping parser versions separate', async () => {
+    const encoded = canonical({
+      ...qrV3Fixture.valid.presentation_unsigned,
+      s: qrV3Fixture.valid.device_signature,
+    });
+    expect(p256.verify(
+      Buffer.from(qrV3Fixture.valid.authority_signature, 'base64url'),
+      digest(qrV3Fixture.valid.credential_payload),
+      Buffer.from(qrV3Fixture.verification.authority_public_key, 'base64url')
+    )).toBe(true);
+    expect(p256.verify(
+      Buffer.from(qrV3Fixture.valid.device_signature, 'base64url'),
+      digest(qrV3Fixture.valid.presentation_unsigned),
+      Buffer.from(qrV3Fixture.verification.device_public_key, 'base64url')
+    )).toBe(true);
+    expect(Buffer.byteLength(encoded)).toBe(qrV3Fixture.valid.encoded_utf8_bytes);
+    expect(qrV3Fixture.mutations).toHaveLength(23);
+    await expect(QrCredentialService.verify(
+      encoded,
+      qrV3Fixture.verification.expected_event_id,
+      qrV3Fixture.verification.authority_public_key,
+      qrV3Fixture.verification.now * 1_000
+    )).resolves.toMatchObject({ valid: false, reason: 'Unsupported QR credential' });
   });
 });

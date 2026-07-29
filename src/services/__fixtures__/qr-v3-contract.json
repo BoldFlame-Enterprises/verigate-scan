@@ -1,0 +1,204 @@
+{
+  "contract": "verigate-qr-v3",
+  "canonicalization": "recursive-key-sorted-json-utf8",
+  "signature": "P-256/SHA-256/IEEE-P1363",
+  "limits": {
+    "encoded_utf8_bytes": 800,
+    "presentation_lifetime_seconds": 60,
+    "clock_skew_seconds": 60,
+    "nonce_bytes": 16,
+    "credential_id_bytes": 16,
+    "public_key_bytes": 65,
+    "signature_bytes": 64,
+    "kid_max_chars": 32,
+    "device_id_max_chars": 64
+  },
+  "verification": {
+    "now": 1785340800,
+    "expected_event_id": 4,
+    "authority_public_key": "BGsX0fLhLEJH-Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU",
+    "device_public_key": "BHzyexiNA09-ilI4AwS1GsPAiWnid_IbNaYLSPxHZpl4B3dVENuO0EApPZrGn3Qw27p9reY86YIpngS3nSJ4c9E"
+  },
+  "valid": {
+    "credential_payload": {
+      "v": 3,
+      "kid": "qr-2026-01",
+      "cid": "ABEiM0RVZneImaq7zN3u_w",
+      "cg": 12,
+      "uid": 7,
+      "eid": 4,
+      "did": "pass-550e8400-e29b-41d4-a716-446655440000",
+      "rg": 3,
+      "dpk": "BHzyexiNA09-ilI4AwS1GsPAiWnid_IbNaYLSPxHZpl4B3dVENuO0EApPZrGn3Qw27p9reY86YIpngS3nSJ4c9E",
+      "iat": 1785340800,
+      "exp": 1785427200
+    },
+    "credential_sha256": "f44dfbb06ad209bf0b2033ad87da7d135183a199298d6dc3b1abd83fb2f50da2",
+    "authority_signature": "mTeiXhMIQNnstAExz6UG3CSyvrSnIkZuojC9Z2HylyUGkHy8PmTW43WZI7zJf8jP2I3B8Uj6TsdIXrspVX8oAw",
+    "presentation_unsigned": {
+      "v": 3,
+      "c": {
+        "p": {
+          "v": 3,
+          "kid": "qr-2026-01",
+          "cid": "ABEiM0RVZneImaq7zN3u_w",
+          "cg": 12,
+          "uid": 7,
+          "eid": 4,
+          "did": "pass-550e8400-e29b-41d4-a716-446655440000",
+          "rg": 3,
+          "dpk": "BHzyexiNA09-ilI4AwS1GsPAiWnid_IbNaYLSPxHZpl4B3dVENuO0EApPZrGn3Qw27p9reY86YIpngS3nSJ4c9E",
+          "iat": 1785340800,
+          "exp": 1785427200
+        },
+        "s": "mTeiXhMIQNnstAExz6UG3CSyvrSnIkZuojC9Z2HylyUGkHy8PmTW43WZI7zJf8jP2I3B8Uj6TsdIXrspVX8oAw"
+      },
+      "iat": 1785340800,
+      "exp": 1785340860,
+      "n": "AAECAwQFBgcICQoLDA0ODw"
+    },
+    "presentation_sha256": "e8339990283db13855324b1e621fe290135e0fc82080d53da8c510af0aa31efc",
+    "device_signature": "PMvRIiwja2e00OEgOmHf2KBHFDOefmIYK5w1sEi_v25rdKARAn-hkpId95bZB3QZFgB8rNYhuKHiQE98jV-RfQ",
+    "encoded_utf8_bytes": 535
+  },
+  "mutations": [
+    {
+      "id": "malformed-json",
+      "change": "replace-encoded:{",
+      "decision": "deny",
+      "code": "malformed_schema"
+    },
+    {
+      "id": "wrong-types",
+      "change": "set:v:3",
+      "decision": "deny",
+      "code": "malformed_schema"
+    },
+    {
+      "id": "missing-field",
+      "change": "delete:c.p.cid",
+      "decision": "deny",
+      "code": "malformed_schema"
+    },
+    {
+      "id": "unknown-field",
+      "change": "set:x:true",
+      "decision": "deny",
+      "code": "malformed_schema"
+    },
+    {
+      "id": "oversized-payload",
+      "change": "set:c.p.did:256",
+      "decision": "deny",
+      "code": "payload_too_large"
+    },
+    {
+      "id": "wrong-event",
+      "change": "set:c.p.eid:5",
+      "decision": "deny",
+      "code": "wrong_event"
+    },
+    {
+      "id": "authority-signature-mutation",
+      "change": "flip-byte:c.s:0",
+      "decision": "deny",
+      "code": "invalid_authority_signature"
+    },
+    {
+      "id": "device-signature-mutation",
+      "change": "flip-byte:s:0",
+      "decision": "deny",
+      "code": "invalid_device_signature"
+    },
+    {
+      "id": "wrong-curve",
+      "change": "replace-key:c.p.dpk:P-384",
+      "decision": "deny",
+      "code": "invalid_device_key"
+    },
+    {
+      "id": "wrong-key-length",
+      "change": "truncate-byte:c.p.dpk",
+      "decision": "deny",
+      "code": "invalid_device_key"
+    },
+    {
+      "id": "credential-expired-minus-one",
+      "change": "verify-at:1785427261",
+      "decision": "deny",
+      "code": "credential_expired"
+    },
+    {
+      "id": "credential-expired-boundary",
+      "change": "verify-at:1785427260",
+      "decision": "allow",
+      "code": "valid"
+    },
+    {
+      "id": "credential-future-plus-one",
+      "change": "set:c.p.iat:1785340861",
+      "decision": "deny",
+      "code": "credential_not_yet_valid"
+    },
+    {
+      "id": "credential-future-boundary",
+      "change": "set:c.p.iat:1785340860",
+      "decision": "allow_after_resign",
+      "code": "valid"
+    },
+    {
+      "id": "presentation-expired-plus-one",
+      "change": "verify-at:1785340921",
+      "decision": "deny",
+      "code": "presentation_expired"
+    },
+    {
+      "id": "presentation-expired-boundary",
+      "change": "verify-at:1785340920",
+      "decision": "allow",
+      "code": "valid"
+    },
+    {
+      "id": "inverted-credential-interval",
+      "change": "set:c.p.exp:1785340799",
+      "decision": "deny",
+      "code": "invalid_interval"
+    },
+    {
+      "id": "inverted-presentation-interval",
+      "change": "set:exp:1785340799",
+      "decision": "deny",
+      "code": "invalid_interval"
+    },
+    {
+      "id": "revoked-credential-generation",
+      "change": "set-trust:credential_generation:13",
+      "decision": "deny",
+      "code": "credential_revoked"
+    },
+    {
+      "id": "revoked-device-generation",
+      "change": "set-trust:registration_generation:4",
+      "decision": "deny",
+      "code": "device_revoked"
+    },
+    {
+      "id": "unknown-key-id",
+      "change": "set:c.p.kid:qr-unknown",
+      "decision": "deny",
+      "code": "unknown_authority_key"
+    },
+    {
+      "id": "repeated-nonce",
+      "change": "verify-twice:n",
+      "decision": "allow_and_correlate",
+      "code": "repeated_presentation"
+    },
+    {
+      "id": "v2-parser-separation",
+      "change": "replace-version:verigate-qr-v2",
+      "decision": "route_to_v2_only",
+      "code": "unsupported_protocol"
+    }
+  ]
+}

@@ -4,7 +4,19 @@ The mobile app scanners/staff use to verify attendee QR codes offline against a 
 
 ## 🚀 Features
 
-- **Offline QR verification**: signature + expiry + area-access checks run entirely against the local encrypted SQLite store, no network required.
+- **Offline QR verification**: strict, separate v2/v3 parsers verify authority
+  and Pass-device P-256 signatures, time/event bounds, synchronized revocations,
+  and current active area/access assignments against encrypted local state.
+- **Bounded trust freshness**: a trust snapshot is current for 60 seconds,
+  soft-stale until its 24-hour hard expiry, and unusable afterward. Current
+  conclusive decisions stay local; cryptographically valid but inconclusive
+  decisions use authenticated server authority when reachable and otherwise
+  deny.
+- **Complete decision evidence**: every camera attempt receives a durable
+  `device_scan_id`, including malformed and unknown-subject denials. Queue and
+  server fallback share idempotent acknowledgements and retain decision code,
+  source, credential identity/nonce hash, trust generation, and snapshot time—
+  never raw QR, nonce, signatures, or key material.
 - **Area selection**: pick which area you're stationed at (from the areas synced for the event) before scanning.
 - **Visual + audio feedback**: distinct green/red overlays plus a bright short "granted" tone and a lower sustained "denied" buzz (`expo-av`), tuned to be audible/visible in noisy, low-light entrances; the scan screen runs a dark theme throughout.
 - **Manual entry fallback**: verify an attendee by email when their QR is damaged or unreadable.
@@ -17,7 +29,7 @@ The mobile app scanners/staff use to verify attendee QR codes offline against a 
   then clears local tokens, queues' active authority, and UI state even if the
   network request fails.
 
-- **Durable queue acknowledgements**: scans, incidents, and overrides preserve client record IDs, originating events, payloads, and occurrence times. Incident/override uploads process at most two batches of ten per foreground cycle. Accepted/known-duplicate records become synced, structured terminal rejections remain retained with bounded error metadata, and authentication/transient failures remain pending and stop safely.
+- **Durable queue acknowledgements**: scans, incidents, and overrides preserve client record IDs, originating events, bounded evidence, and occurrence times. Incident/override uploads process at most two batches of ten per foreground cycle. Accepted/known-duplicate records become synced, structured terminal rejections remain retained with bounded error metadata, and authentication/transient failures remain pending and stop safely.
 - **Installation-qualified legacy identities**: one SecureStore-backed installation identity is shared by heartbeat and migration of pending rows that never received a client identity. It remains stable across restarts; newly queued records continue to use random UUIDs. A build that finds an already-assigned weak `legacy-incident-<row>` or `legacy-override-<row>` identity stops before changing it because a lost upload acknowledgement cannot be distinguished locally from a never-uploaded row.
 - **Sync-stale local warning**: a local notification (`expo-notifications`) fires if the device hasn't synced recently - there is no remote push in this app by design (scanners are expected to be actively at the device).
 
@@ -60,6 +72,11 @@ Private local EAS/signing/provider files such as `credentials.json`, `*.jks`, `*
 ## Validation boundary
 
 Repository release evidence covers signed Android cloud build/publication for an exact source revision. It does not prove installation, physical camera/biometric/SQLCipher behavior, offline recovery after process kill, two-device replay handling, or any iOS behavior. Scan intentionally implements only local sync-stale notifications; logout cancels the session-local warning before authentication state is cleared.
+
+Strict v2 verification remains a compatibility path. Do not remove it until
+supported Scan adoption, synchronized trust freshness, Pass v3 adoption, the
+maximum legacy credential/offline windows, physical camera coverage, and the
+staged authority-key overlap exercise have all been recorded and approved.
 
 Do not release the installation-identity migration until the deployed Scan
 inventory and the lost-ack reconciliation policy are approved with compatible

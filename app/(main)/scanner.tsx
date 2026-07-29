@@ -13,6 +13,7 @@ import {
   Switch,
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
+import * as Crypto from 'expo-crypto';
 import { router } from 'expo-router';
 import { useScanner } from '../../src/context/ScannerContext';
 import { DatabaseService } from '../../src/services/DatabaseService';
@@ -146,21 +147,123 @@ export default function ScannerScreen() {
     setIsScanning(false);
 
     try {
-      const verification = await DatabaseService.verifyQRCode(data, scanArea, eventId);
+      const deviceScanId = Crypto.randomUUID();
+      const scannedAt = new Date().toISOString();
+      const [areas, scannerInstallationId, trust] = await Promise.all([
+        DatabaseService.getSyncedAreas(eventId),
+        SyncService.getDeviceId(),
+        DatabaseService.getQrTrustMaterial(eventId),
+      ]);
+      const areaId = areas.find((area) => area.name === scanArea)?.id;
+      if (!areaId) throw new Error('Selected area is not in the synchronized event snapshot');
 
-      if (verification.user) {
-        const areas = await DatabaseService.getSyncedAreas(eventId);
-        await DatabaseService.logScan({
-          event_id: eventId,
-          user_id: verification.user.id,
-          user_name: verification.user.name,
-          area: scanArea,
-          area_id: areas.find((area) => area.name === scanArea)?.id,
-          access_granted: verification.success,
-          failure_reason: verification.success ? undefined : verification.reason,
-          scanned_at: new Date().toISOString(),
-          scanner_user: scannerUser.name
-        });
+      const local = await DatabaseService.verifyQRCode(data, scanArea, eventId);
+      let verification = local;
+      let decisionSource: 'offline-current' | 'offline-stale' | 'server' =
+        local.trust_freshness === 'stale' || local.trust_freshness === 'expired'
+          ? 'offline-stale'
+          : 'offline-current';
+      let fallbackAcknowledged = false;
+
+      if (local.conclusive === false) {
+        if (ApiClient.isAuthenticated()) {
+          try {
+            const server = await ApiClient.request<{
+              access_granted: boolean;
+              reason?: string;
+              credential_id?: string;
+              nonce_hash?: string;
+              decision_code?: string;
+              user?: { id: number; name: string };
+              persistence?: {
+                client_record_id: string;
+                status: 'accepted' | 'duplicate' | 'rejected' | 'retryable_error';
+              };
+            }>('/scan/verify', {
+              method: 'POST',
+              body: {
+                qr_code: data,
+                area_id: areaId,
+                event_id: eventId,
+                device_scan_id: deviceScanId,
+                device_info: { app: 'scan' },
+                local_evidence: {
+                  trust_generation: trust?.generation ?? null,
+                  trust_freshness: local.trust_freshness ?? null,
+                  user_snapshot_at: lastSyncAt
+                    ? new Date(lastSyncAt).toISOString()
+                    : null,
+                },
+              },
+            });
+            verification = {
+              success: server.access_granted,
+              reason: server.reason,
+              code: server.decision_code,
+              conclusive: true,
+              credential_id: server.credential_id,
+              nonce_hash: server.nonce_hash,
+              trust_freshness: local.trust_freshness,
+              user: server.user
+                ? {
+                  id: server.user.id,
+                  name: server.user.name,
+                  email: '',
+                  phone: '',
+                  event_id: eventId,
+                  assignments: [],
+                  access_level: '',
+                  allowed_areas: [],
+                  is_active: true,
+                }
+                : undefined,
+            };
+            decisionSource = 'server';
+            fallbackAcknowledged =
+              server.persistence?.client_record_id === deviceScanId &&
+              (server.persistence.status === 'accepted' ||
+                server.persistence.status === 'duplicate');
+          } catch {
+            verification = {
+              ...local,
+              success: false,
+              reason: 'Current server authority is unavailable; access denied',
+              code: 'fallback_unavailable',
+              conclusive: true,
+            };
+          }
+        } else {
+          verification = {
+            ...local,
+            success: false,
+            reason: 'Synchronization is required before this decision can be made',
+            code: 'fallback_unavailable',
+            conclusive: true,
+          };
+        }
+      }
+
+      await DatabaseService.logScan({
+        event_id: eventId,
+        user_id: verification.user?.id ?? null,
+        user_name: verification.user?.name ?? null,
+        area: scanArea,
+        area_id: areaId,
+        access_granted: verification.success,
+        failure_reason: verification.success ? undefined : verification.reason,
+        scanned_at: scannedAt,
+        scanner_user: scannerUser.name,
+        device_scan_id: deviceScanId,
+        credential_id: verification.credential_id,
+        nonce_hash: verification.nonce_hash,
+        decision_code: verification.code,
+        decision_source: decisionSource,
+        trust_generation: trust?.generation ?? null,
+        user_snapshot_at: lastSyncAt ? new Date(lastSyncAt).toISOString() : null,
+        scanner_installation_id: scannerInstallationId,
+      });
+      if (fallbackAcknowledged) {
+        await DatabaseService.markScanLogSyncedByDeviceId(deviceScanId);
       }
 
       if (verification.success) {
@@ -199,7 +302,7 @@ export default function ScannerScreen() {
         setIsScanning(true);
       }, 2000);
     }
-  }, [eventId, isScanning, scannerUser, selectedArea, setLastScanResult]);
+  }, [eventId, isScanning, lastSyncAt, scannerUser, selectedArea, setLastScanResult]);
 
   const handleLogout = () => {
     Alert.alert(

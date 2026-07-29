@@ -298,6 +298,15 @@ class SyncServiceClass {
               failure_reason: record.failure_reason,
               scanned_at: record.scanned_at,
               device_scan_id: record.device_scan_id,
+              credential_id: record.credential_id,
+              nonce_hash: record.nonce_hash,
+              decision_code: record.decision_code,
+              decision_source: record.decision_source,
+              trust_generation: record.trust_generation,
+              user_snapshot_at: record.user_snapshot_at,
+              device_info: {
+                scanner_installation_id: record.scanner_installation_id,
+              },
             })),
           },
         }
@@ -411,6 +420,15 @@ class SyncServiceClass {
           failure_reason: log.failure_reason,
           scanned_at: log.scanned_at,
           device_scan_id: log.device_scan_id,
+          credential_id: log.credential_id,
+          nonce_hash: log.nonce_hash,
+          decision_code: log.decision_code,
+          decision_source: log.decision_source,
+          trust_generation: log.trust_generation,
+          user_snapshot_at: log.user_snapshot_at,
+          device_info: {
+            scanner_installation_id: log.scanner_installation_id,
+          },
         }));
 
         const response = await withBackoff(() =>

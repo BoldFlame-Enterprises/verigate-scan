@@ -84,7 +84,7 @@ describe('DatabaseService event-scoped users', () => {
 
     await service.createTables();
 
-    expect(database.executeBatchAsync).toHaveBeenCalledTimes(1);
+    expect(database.executeBatchAsync).toHaveBeenCalledTimes(2);
     const commands = database.executeBatchAsync.mock.calls[0][0];
     expect(compact(commands[1][0])).toContain('PRIMARY KEY (event_id, id)');
     expect(compact(commands[1][0])).toContain('UNIQUE (event_id, email)');
@@ -92,6 +92,13 @@ describe('DatabaseService event-scoped users', () => {
     expect(commands.map(([sql]) => compact(sql))).toEqual(expect.arrayContaining([
       'DROP TABLE users',
       'ALTER TABLE users_event_scoped RENAME TO users',
+    ]));
+    const scanCommands = database.executeBatchAsync.mock.calls[1][0];
+    expect(compact(scanCommands[1][0])).toContain('user_id INTEGER, user_name TEXT');
+    expect(compact(scanCommands[2][0])).toContain('credential_id, nonce_hash, decision_code');
+    expect(scanCommands.map(([sql]) => compact(sql))).toEqual(expect.arrayContaining([
+      'DROP TABLE scan_logs',
+      'ALTER TABLE scan_logs_decision_evidence RENAME TO scan_logs',
     ]));
   });
 
@@ -377,6 +384,61 @@ describe('DatabaseService event-scoped users', () => {
       'DELETE FROM qr_trust_stage_keys WHERE event_id = ?',
       'DELETE FROM qr_trust_stage_revocations WHERE event_id = ?',
     ]));
+  });
+
+  it('records nullable-subject decision evidence without raw QR content and acknowledges by attempt id', async () => {
+    const database = createDatabaseDouble();
+    service.database = database;
+
+    await DatabaseService.logScan({
+      event_id: 11,
+      user_id: null,
+      user_name: null,
+      area: 'Arena',
+      area_id: 3,
+      access_granted: false,
+      failure_reason: 'Invalid QR format',
+      scanned_at: '2026-07-29T00:00:00.000Z',
+      scanner_user: 'Scanner',
+      device_scan_id: 'camera-attempt-1',
+      credential_id: null,
+      nonce_hash: null,
+      decision_code: 'malformed_schema',
+      decision_source: 'offline-current',
+      trust_generation: 8,
+      user_snapshot_at: '2026-07-29T00:00:00.000Z',
+      scanner_installation_id: 'scan-installation-1',
+    });
+    await DatabaseService.markScanLogSyncedByDeviceId('camera-attempt-1');
+
+    expect(compact(database.runAsync.mock.calls[0][0])).toContain(
+      'credential_id, nonce_hash, decision_code, decision_source'
+    );
+    expect(database.runAsync.mock.calls[0][1]).toEqual([
+      11,
+      null,
+      null,
+      'Arena',
+      3,
+      0,
+      'Invalid QR format',
+      '2026-07-29T00:00:00.000Z',
+      'Scanner',
+      'camera-attempt-1',
+      null,
+      null,
+      'malformed_schema',
+      'offline-current',
+      8,
+      '2026-07-29T00:00:00.000Z',
+      'scan-installation-1',
+    ]);
+    expect(JSON.stringify(database.runAsync.mock.calls[0])).not.toContain('qr_code');
+    expect(database.runAsync).toHaveBeenNthCalledWith(
+      2,
+      'UPDATE scan_logs SET synced = 1 WHERE device_scan_id = ?',
+      ['camera-attempt-1']
+    );
   });
 
   it('denies signed or local assignments whose active-resource projection is incomplete', async () => {

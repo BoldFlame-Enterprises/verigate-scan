@@ -47,8 +47,8 @@ export interface ScannerUser {
 export interface ScanLog {
   id?: number;
   event_id: number;
-  user_id: number;
-  user_name: string;
+  user_id: number | null;
+  user_name: string | null;
   area: string;
   area_id?: number;
   access_granted: boolean;
@@ -56,6 +56,13 @@ export interface ScanLog {
   scanned_at: string;
   scanner_user: string;
   device_scan_id?: string;
+  credential_id?: string | null;
+  nonce_hash?: string | null;
+  decision_code?: string | null;
+  decision_source?: 'offline-current' | 'offline-stale' | 'server';
+  trust_generation?: number | null;
+  user_snapshot_at?: string | null;
+  scanner_installation_id?: string | null;
 }
 
 export interface QueuedIncident {
@@ -249,8 +256,8 @@ class DatabaseServiceClass {
       CREATE TABLE IF NOT EXISTS scan_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_id INTEGER NOT NULL,
-        user_id INTEGER NOT NULL,
-        user_name TEXT NOT NULL,
+        user_id INTEGER,
+        user_name TEXT,
         area TEXT NOT NULL,
         area_id INTEGER,
         access_granted INTEGER NOT NULL,
@@ -258,6 +265,13 @@ class DatabaseServiceClass {
         scanned_at TEXT NOT NULL,
         scanner_user TEXT NOT NULL,
         device_scan_id TEXT UNIQUE,
+        credential_id TEXT,
+        nonce_hash TEXT,
+        decision_code TEXT,
+        decision_source TEXT,
+        trust_generation INTEGER,
+        user_snapshot_at TEXT,
+        scanner_installation_id TEXT,
         synced INTEGER DEFAULT 0
       );
     `);
@@ -376,6 +390,7 @@ class DatabaseServiceClass {
     await this.addColumnIfMissing('users', 'assignments', "TEXT NOT NULL DEFAULT '[]'");
     await this.migrateUsersToEventScopedIdentity();
     await this.addColumnIfMissing('scan_logs', 'event_id', 'INTEGER NOT NULL DEFAULT 0');
+    await this.migrateScanLogsToDecisionEvidence();
     await this.addColumnIfMissing('incidents_queue', 'client_record_id', 'TEXT');
     await this.addColumnIfMissing('incidents_queue', 'occurred_at', 'TEXT');
     await this.addColumnIfMissing('incidents_queue', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
@@ -477,6 +492,75 @@ class DatabaseServiceClass {
        FROM users`],
       ['DROP TABLE users'],
       ['ALTER TABLE users_event_scoped RENAME TO users'],
+    ]);
+  }
+
+  private async migrateScanLogsToDecisionEvidence(): Promise<void> {
+    if (!this.database) throw new Error('Database not initialized');
+    const columns = await this.database.getAllAsync('PRAGMA table_info(scan_logs)') as {
+      name: string;
+      notnull: number;
+    }[];
+    const names = new Set(columns.map((column) => column.name));
+    const required = [
+      'credential_id',
+      'nonce_hash',
+      'decision_code',
+      'decision_source',
+      'trust_generation',
+      'user_snapshot_at',
+      'scanner_installation_id',
+    ];
+    const userId = columns.find((column) => column.name === 'user_id');
+    const userName = columns.find((column) => column.name === 'user_name');
+    if (
+      required.every((column) => names.has(column)) &&
+      userId?.notnull === 0 &&
+      userName?.notnull === 0
+    ) return;
+
+    const source = (column: string, fallback = 'NULL') =>
+      names.has(column) ? column : fallback;
+    await this.database.executeBatchAsync([
+      ['DROP TABLE IF EXISTS scan_logs_decision_evidence'],
+      [`CREATE TABLE scan_logs_decision_evidence (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id INTEGER NOT NULL,
+        user_id INTEGER,
+        user_name TEXT,
+        area TEXT NOT NULL,
+        area_id INTEGER,
+        access_granted INTEGER NOT NULL,
+        failure_reason TEXT,
+        scanned_at TEXT NOT NULL,
+        scanner_user TEXT NOT NULL,
+        device_scan_id TEXT UNIQUE,
+        credential_id TEXT,
+        nonce_hash TEXT,
+        decision_code TEXT,
+        decision_source TEXT,
+        trust_generation INTEGER,
+        user_snapshot_at TEXT,
+        scanner_installation_id TEXT,
+        synced INTEGER DEFAULT 0
+      )`],
+      [`INSERT INTO scan_logs_decision_evidence (
+          id, event_id, user_id, user_name, area, area_id, access_granted,
+          failure_reason, scanned_at, scanner_user, device_scan_id,
+          credential_id, nonce_hash, decision_code, decision_source,
+          trust_generation, user_snapshot_at, scanner_installation_id, synced
+        )
+        SELECT
+          id, ${source('event_id', '0')}, user_id, user_name, area, area_id,
+          access_granted, failure_reason, scanned_at, scanner_user,
+          ${source('device_scan_id')}, ${source('credential_id')},
+          ${source('nonce_hash')}, ${source('decision_code')},
+          ${source('decision_source')}, ${source('trust_generation')},
+          ${source('user_snapshot_at')}, ${source('scanner_installation_id')},
+          ${source('synced', '0')}
+        FROM scan_logs`],
+      ['DROP TABLE scan_logs'],
+      ['ALTER TABLE scan_logs_decision_evidence RENAME TO scan_logs'],
     ]);
   }
 
@@ -772,8 +856,11 @@ class DatabaseServiceClass {
 
     await this.database.runAsync(
       `INSERT INTO scan_logs
-         (event_id, user_id, user_name, area, area_id, access_granted, failure_reason, scanned_at, scanner_user, device_scan_id, synced)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+         (event_id, user_id, user_name, area, area_id, access_granted,
+          failure_reason, scanned_at, scanner_user, device_scan_id,
+          credential_id, nonce_hash, decision_code, decision_source,
+          trust_generation, user_snapshot_at, scanner_installation_id, synced)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
       [
         scanLog.event_id,
         scanLog.user_id,
@@ -784,7 +871,14 @@ class DatabaseServiceClass {
         scanLog.failure_reason ?? null,
         scanLog.scanned_at,
         scanLog.scanner_user,
-        deviceScanId
+        deviceScanId,
+        scanLog.credential_id ?? null,
+        scanLog.nonce_hash ?? null,
+        scanLog.decision_code ?? null,
+        scanLog.decision_source ?? null,
+        scanLog.trust_generation ?? null,
+        scanLog.user_snapshot_at ?? null,
+        scanLog.scanner_installation_id ?? null
       ]
     );
   }
@@ -914,6 +1008,13 @@ class DatabaseServiceClass {
       scanned_at: row.scanned_at,
       scanner_user: row.scanner_user,
       device_scan_id: row.device_scan_id,
+      credential_id: row.credential_id,
+      nonce_hash: row.nonce_hash,
+      decision_code: row.decision_code,
+      decision_source: row.decision_source,
+      trust_generation: row.trust_generation,
+      user_snapshot_at: row.user_snapshot_at,
+      scanner_installation_id: row.scanner_installation_id,
     }));
   }
 
@@ -935,6 +1036,13 @@ class DatabaseServiceClass {
       scanned_at: row.scanned_at,
       scanner_user: row.scanner_user,
       device_scan_id: row.device_scan_id,
+      credential_id: row.credential_id,
+      nonce_hash: row.nonce_hash,
+      decision_code: row.decision_code,
+      decision_source: row.decision_source,
+      trust_generation: row.trust_generation,
+      user_snapshot_at: row.user_snapshot_at,
+      scanner_installation_id: row.scanner_installation_id,
     }));
   }
 
@@ -942,6 +1050,14 @@ class DatabaseServiceClass {
     if (!this.database || ids.length === 0) return;
     const placeholders = ids.map(() => '?').join(',');
     await this.database.runAsync(`UPDATE scan_logs SET synced = 1 WHERE id IN (${placeholders})`, ids);
+  }
+
+  async markScanLogSyncedByDeviceId(deviceScanId: string): Promise<void> {
+    if (!this.database) return;
+    await this.database.runAsync(
+      'UPDATE scan_logs SET synced = 1 WHERE device_scan_id = ?',
+      [deviceScanId]
+    );
   }
 
   async queueIncident(eventId: number, category: string, description: string, area?: string, areaId?: number): Promise<void> {
@@ -1372,7 +1488,12 @@ class DatabaseServiceClass {
         trust_freshness: verification.trust_freshness,
       };
     } catch {
-      return { success: false, reason: 'Invalid QR code data' };
+      return {
+        success: false,
+        reason: 'Invalid QR code data',
+        code: 'malformed_schema',
+        conclusive: true,
+      };
     }
   }
 

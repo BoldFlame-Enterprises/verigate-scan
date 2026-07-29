@@ -1,7 +1,8 @@
 import * as SecureStore from 'expo-secure-store';
+import * as Crypto from 'expo-crypto';
 import { Platform } from 'react-native';
 import { ApiClient, ApiError } from './ApiClient';
-import { DatabaseService, User } from './DatabaseService';
+import { DatabaseService, QrTrustPage, User } from './DatabaseService';
 import {
   AUXILIARY_UPLOAD_BATCH_SIZE,
   AUXILIARY_UPLOAD_MAX_BATCHES_PER_SYNC,
@@ -75,6 +76,28 @@ async function withBackoff<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
   throw lastError;
 }
 
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value as Record<string, unknown>).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`
+    ).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function verifyTrustChecksum(page: QrTrustPage): Promise<void> {
+  const { checksum, ...normalized } = page;
+  const actual = await Crypto.digestStringAsync(
+    Crypto.CryptoDigestAlgorithm.SHA256,
+    canonical(normalized),
+    { encoding: Crypto.CryptoEncoding.HEX }
+  );
+  if (!/^[a-f0-9]{64}$/.test(checksum) || actual !== checksum) {
+    throw new Error('QR trust page checksum is invalid');
+  }
+}
+
 class SyncServiceClass {
   private inFlight: Promise<SyncResult> | null = null;
 
@@ -131,6 +154,7 @@ class SyncServiceClass {
         }>('/sync/areas-database', { params: { event_id: eventId! } })),
       ]);
 
+      await this.syncQrTrust(eventId);
       await DatabaseService.upsertSyncedUsers(eventId, usersData.users);
       await DatabaseService.upsertSyncedAreas(eventId, areasData.areas);
       await DatabaseService.setQrAuthorityPublicKey(eventId, areasData.qr_authority_public_key);
@@ -201,6 +225,33 @@ class SyncServiceClass {
         deviceControlReason,
       };
     }
+  }
+
+  private async syncQrTrust(eventId: number): Promise<void> {
+    let cursor: string | undefined;
+    let snapshotGeneration: number | null = null;
+    for (let pageNumber = 0; pageNumber < 100; pageNumber += 1) {
+      const page = await withBackoff(() => ApiClient.request<QrTrustPage>(
+        '/sync/qr-trust',
+        { params: { event_id: eventId, limit: 200, ...(cursor ? { cursor } : {}) } }
+      ));
+      await verifyTrustChecksum(page);
+      if (page.event_id !== eventId) throw new Error('QR trust page belongs to another event');
+      if (snapshotGeneration == null) snapshotGeneration = page.snapshot_generation;
+      if (page.snapshot_generation !== snapshotGeneration) {
+        throw new Error('QR trust snapshot changed during pagination');
+      }
+      await DatabaseService.stageQrTrustPage(page, pageNumber === 0);
+      if (!page.has_more) {
+        await DatabaseService.promoteQrTrustSnapshot(eventId, snapshotGeneration);
+        return;
+      }
+      if (!page.next_cursor || page.next_cursor === cursor) {
+        throw new Error('QR trust pagination did not advance');
+      }
+      cursor = page.next_cursor;
+    }
+    throw new Error('QR trust synchronization exceeded 100 pages');
   }
 
   async drainDeregisteredAuditQueues(

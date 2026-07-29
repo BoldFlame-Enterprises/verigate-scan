@@ -7,7 +7,11 @@ jest.mock('expo-crypto', () => ({
   digestStringAsync: jest.fn(async (_algorithm: string, value: string) => jest.requireActual('crypto').createHash('sha256').update(value).digest('hex')),
 }));
 
-import { QrCredentialService, QR_PROTOCOL_VERSION } from '../QrCredentialService';
+import {
+  QrCredentialService,
+  QR_PROTOCOL_VERSION,
+  QrTrustMaterial,
+} from '../QrCredentialService';
 import qrV3Fixture from '../__fixtures__/qr-v3-contract.json';
 
 const SPKI_PREFIX = '3059301306072a8648ce3d020106082a8648ce3d030107034200';
@@ -64,6 +68,30 @@ function fixture(eventId = 9): { encoded: string; authorityPublicKey: string } {
   };
 }
 
+function v3Fixture(): { encoded: string; trust: QrTrustMaterial; now: number } {
+  const now = qrV3Fixture.verification.now * 1_000;
+  return {
+    encoded: canonical({
+      ...qrV3Fixture.valid.presentation_unsigned,
+      s: qrV3Fixture.valid.device_signature,
+    }),
+    now,
+    trust: {
+      generation: 1,
+      generated_at: new Date(now).toISOString(),
+      hard_expires_at: new Date(now + 24 * 60 * 60 * 1_000).toISOString(),
+      authority_keys: [{
+        kid: 'qr-2026-01',
+        public_key: qrV3Fixture.verification.authority_public_key,
+        status: 'active',
+        verify_until: null,
+      }],
+      revocations: [],
+      legacy_authority_public_key: null,
+    },
+  };
+}
+
 describe('QrCredentialService', () => {
   it('accepts a valid authority- and device-signed event presentation', async () => {
     const value = fixture();
@@ -100,6 +128,82 @@ describe('QrCredentialService', () => {
       qrV3Fixture.verification.expected_event_id,
       qrV3Fixture.verification.authority_public_key,
       qrV3Fixture.verification.now * 1_000
-    )).resolves.toMatchObject({ valid: false, reason: 'Unsupported QR credential' });
+    )).resolves.toMatchObject({
+      valid: false,
+      code: 'trust_snapshot_required',
+      conclusive: false,
+    });
+  });
+
+  it('verifies the compact v3 fixture using synchronized trust material', async () => {
+    const value = v3Fixture();
+
+    await expect(QrCredentialService.verifyWithTrust(
+      value.encoded,
+      qrV3Fixture.verification.expected_event_id,
+      value.trust,
+      value.now
+    )).resolves.toMatchObject({
+      valid: true,
+      code: 'valid',
+      conclusive: true,
+      trust_freshness: 'current',
+      presentation: {
+        user_id: 7,
+        event_id: 4,
+        credential_id: '00112233-4455-6677-8899-aabbccddeeff',
+        device_id: 'pass-550e8400-e29b-41d4-a716-446655440000',
+        credential_generation: 12,
+        registration_generation: 3,
+        protocol: 3,
+        nonce_hash: 'be45cb2605bf36bebde684841a28f0fd43c69850a3dce5fedba69928ee3a8991',
+      },
+    });
+  });
+
+  it('distinguishes credential and registration-generation revocations', async () => {
+    const value = v3Fixture();
+    const credentialRevoked: QrTrustMaterial = {
+      ...value.trust,
+      revocations: [{
+        generation: 2,
+        credential_id: '00112233-4455-6677-8899-aabbccddeeff',
+        device_id: 'pass-550e8400-e29b-41d4-a716-446655440000',
+        registration_generation: 3,
+      }],
+    };
+    await expect(QrCredentialService.verifyWithTrust(
+      value.encoded, 4, credentialRevoked, value.now
+    )).resolves.toMatchObject({ valid: false, code: 'credential_revoked', conclusive: true });
+
+    const deviceRevoked: QrTrustMaterial = {
+      ...value.trust,
+      revocations: [{
+        generation: 3,
+        credential_id: null,
+        device_id: 'pass-550e8400-e29b-41d4-a716-446655440000',
+        registration_generation: 3,
+      }],
+    };
+    await expect(QrCredentialService.verifyWithTrust(
+      value.encoded, 4, deviceRevoked, value.now
+    )).resolves.toMatchObject({ valid: false, code: 'device_revoked', conclusive: true });
+  });
+
+  it('treats an expired trust snapshot as inconclusive', async () => {
+    const value = v3Fixture();
+    const expired = {
+      ...value.trust,
+      hard_expires_at: new Date(value.now - 1).toISOString(),
+    };
+
+    await expect(QrCredentialService.verifyWithTrust(
+      value.encoded, 4, expired, value.now
+    )).resolves.toMatchObject({
+      valid: false,
+      code: 'trust_snapshot_expired',
+      conclusive: false,
+      trust_freshness: 'expired',
+    });
   });
 });

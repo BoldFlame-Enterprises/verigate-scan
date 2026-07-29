@@ -1,7 +1,12 @@
 /* eslint-disable import/first */
 jest.mock('expo-secure-store', () => ({ getItemAsync: jest.fn(async () => null), setItemAsync: jest.fn(async () => undefined) }));
 jest.mock('expo-application', () => ({ getAndroidId: jest.fn(() => 'scan-device'), getIosIdForVendorAsync: jest.fn(async () => 'scan-device') }));
-jest.mock('expo-crypto', () => ({ randomUUID: jest.fn(() => 'fallback-device') }));
+jest.mock('expo-crypto', () => ({
+  randomUUID: jest.fn(() => 'fallback-device'),
+  CryptoDigestAlgorithm: { SHA256: 'SHA256' },
+  CryptoEncoding: { HEX: 'hex' },
+  digestStringAsync: jest.fn(async () => 'a'.repeat(64)),
+}));
 jest.mock('react-native', () => ({ Platform: { OS: 'android' } }));
 jest.mock('../../config', () => ({
   SCAN_UPLOAD_BATCH_SIZE: 25,
@@ -33,6 +38,8 @@ jest.mock('../DatabaseService', () => ({
     upsertSyncedUsers: jest.fn(async () => undefined),
     upsertSyncedAreas: jest.fn(async () => undefined),
     setQrAuthorityPublicKey: jest.fn(async () => undefined),
+    stageQrTrustPage: jest.fn(async () => undefined),
+    promoteQrTrustSnapshot: jest.fn(async () => undefined),
     purgeIfEventExpired: jest.fn(async () => false),
     getUnsyncedScanLogs: jest.fn(async () => []),
     getUnsyncedIncidents: jest.fn(async () => []),
@@ -51,6 +58,19 @@ import { DatabaseService } from '../DatabaseService';
 import { SyncService } from '../SyncService';
 import { OfflineSessionService } from '../OfflineSessionService';
 
+const trustPage = {
+  contract_version: 'qr-trust-v1',
+  event_id: 6,
+  snapshot_generation: 2,
+  generated_at: '2026-07-29T00:00:00.000Z',
+  hard_expires_at: '2026-07-30T00:00:00.000Z',
+  authority_keys: [],
+  revocations: [],
+  has_more: false,
+  next_cursor: 'cursor-2',
+  checksum: 'a'.repeat(64),
+};
+
 describe('SyncService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -66,6 +86,7 @@ describe('SyncService', () => {
       if (path === '/events') return [{ id: 6, name: 'Event', ends_at: null }] as never;
       if (path === '/sync/users-database') return { contract_version: 'event-user-v2', users } as never;
       if (path === '/sync/areas-database') return { areas, qr_authority_public_key: 'authority-key' } as never;
+      if (path === '/sync/qr-trust') return trustPage as never;
       return {} as never;
     });
 
@@ -73,6 +94,7 @@ describe('SyncService', () => {
     expect(result.success).toBe(true);
     expect(DatabaseService.upsertSyncedUsers).toHaveBeenCalledWith(6, users);
     expect(DatabaseService.setQrAuthorityPublicKey).toHaveBeenCalledWith(6, 'authority-key');
+    expect(DatabaseService.promoteQrTrustSnapshot).toHaveBeenCalledWith(6, 2);
     expect(OfflineSessionService.refreshProductionBinding).toHaveBeenCalledWith({
       eventId: 6,
       deviceId: 'scan-installation',
@@ -101,6 +123,7 @@ describe('SyncService', () => {
       if (path === '/events') return [{ id: 6, name: 'Event', ends_at: null }] as never;
       if (path === '/sync/users-database') return { contract_version: 'event-user-v2', users } as never;
       if (path === '/sync/areas-database') return { areas, qr_authority_public_key: 'authority-key' } as never;
+      if (path === '/sync/qr-trust') return trustPage as never;
       if (path === '/incidents') throw new ApiError(503, 'Service unavailable');
       return {} as never;
     });
@@ -111,5 +134,37 @@ describe('SyncService', () => {
     expect(result.error).toBe('Incident upload will retry later');
     expect(DatabaseService.recordIncidentFailure).toHaveBeenCalledWith(1, 'Service unavailable', false);
     expect(DatabaseService.getUnsyncedOverrides).not.toHaveBeenCalled();
+  });
+
+  it('does not promote a partially staged trust snapshot when pagination changes generation', async () => {
+    const users = [{ id: 1, event_id: 6, email: 'user@example.com', name: 'User', phone: '1', is_active: true, assignments: [] }];
+    const areas = [{ id: 3, name: 'Arena', requires_scan: true }];
+    let trustRequest = 0;
+    jest.mocked(ApiClient.request).mockImplementation(async (path: string) => {
+      if (path === '/events') return [{ id: 6, name: 'Event', ends_at: null }] as never;
+      if (path === '/sync/users-database') return { contract_version: 'event-user-v2', users } as never;
+      if (path === '/sync/areas-database') return { areas, qr_authority_public_key: 'authority-key' } as never;
+      if (path === '/sync/qr-trust') {
+        trustRequest += 1;
+        return {
+          ...trustPage,
+          snapshot_generation: trustRequest === 1 ? 2 : 3,
+          has_more: trustRequest === 1,
+          next_cursor: trustRequest === 1 ? 'cursor-1' : 'cursor-3',
+        } as never;
+      }
+      return {} as never;
+    });
+
+    const result = await SyncService.syncNow();
+
+    expect(result).toMatchObject({
+      success: false,
+      error: 'QR trust snapshot changed during pagination',
+    });
+    expect(DatabaseService.stageQrTrustPage).toHaveBeenCalledTimes(1);
+    expect(DatabaseService.promoteQrTrustSnapshot).not.toHaveBeenCalled();
+    expect(DatabaseService.upsertSyncedUsers).not.toHaveBeenCalled();
+    expect(DatabaseService.upsertSyncedAreas).not.toHaveBeenCalled();
   });
 });

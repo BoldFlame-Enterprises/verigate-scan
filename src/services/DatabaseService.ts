@@ -2,7 +2,11 @@ import * as SQLite from './EncryptedSQLite';
 import * as Crypto from 'expo-crypto';
 import * as SecureStore from 'expo-secure-store';
 import { DEMO_MODE } from '../config';
-import { CredentialAssignment, QrCredentialService } from './QrCredentialService';
+import {
+  CredentialAssignment,
+  QrCredentialService,
+  QrTrustMaterial,
+} from './QrCredentialService';
 import {
   DeviceIdentityService,
   legacyQueueRecordPrefix,
@@ -83,6 +87,24 @@ export interface QueuedOverride {
   last_attempt_at: string | null;
   last_error: string | null;
   terminal_failure: boolean;
+}
+
+export interface QrTrustPage {
+  contract_version: 'qr-trust-v1';
+  event_id: number;
+  snapshot_generation: number;
+  generated_at: string;
+  hard_expires_at: string;
+  authority_keys: QrTrustMaterial['authority_keys'];
+  revocations: (QrTrustMaterial['revocations'][number] & {
+    user_id: number;
+    credential_expires_at: string | null;
+    revoked_at: string;
+    reason: string;
+  })[];
+  has_more: boolean;
+  next_cursor: string;
+  checksum: string;
 }
 
 const MAX_QUEUE_ERROR_LENGTH = 500;
@@ -175,7 +197,13 @@ class DatabaseServiceClass {
     if (!eventEndsAtMs || Date.now() < eventEndsAtMs + gracePeriodMs) return false;
     if (!this.database) return false;
 
-    await this.database.execAsync('DELETE FROM users; DELETE FROM synced_areas;');
+    await this.database.execAsync(`
+      DELETE FROM users;
+      DELETE FROM synced_areas;
+      DELETE FROM qr_authority_keys;
+      DELETE FROM qr_revocations;
+      DELETE FROM qr_trust_metadata;
+    `);
     await this.recordIntegrityChecksum();
     return true;
   }
@@ -291,6 +319,56 @@ class DatabaseServiceClass {
         event_id INTEGER PRIMARY KEY,
         qr_authority_public_key TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+    `);
+
+    await this.database.execAsync(`
+      CREATE TABLE IF NOT EXISTS qr_trust_metadata (
+        event_id INTEGER PRIMARY KEY,
+        generation INTEGER NOT NULL,
+        generated_at TEXT NOT NULL,
+        hard_expires_at TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        promoted_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS qr_authority_keys (
+        event_id INTEGER NOT NULL,
+        kid TEXT NOT NULL,
+        public_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        verify_until INTEGER,
+        PRIMARY KEY (event_id, kid)
+      );
+      CREATE TABLE IF NOT EXISTS qr_revocations (
+        event_id INTEGER NOT NULL,
+        generation INTEGER NOT NULL,
+        credential_id TEXT,
+        device_id TEXT NOT NULL,
+        registration_generation INTEGER,
+        PRIMARY KEY (event_id, generation)
+      );
+      CREATE TABLE IF NOT EXISTS qr_trust_stage_metadata (
+        event_id INTEGER PRIMARY KEY,
+        generation INTEGER NOT NULL,
+        generated_at TEXT NOT NULL,
+        hard_expires_at TEXT NOT NULL,
+        checksum TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS qr_trust_stage_keys (
+        event_id INTEGER NOT NULL,
+        kid TEXT NOT NULL,
+        public_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        verify_until INTEGER,
+        PRIMARY KEY (event_id, kid)
+      );
+      CREATE TABLE IF NOT EXISTS qr_trust_stage_revocations (
+        event_id INTEGER NOT NULL,
+        generation INTEGER NOT NULL,
+        credential_id TEXT,
+        device_id TEXT NOT NULL,
+        registration_generation INTEGER,
+        PRIMARY KEY (event_id, generation)
       );
     `);
 
@@ -664,6 +742,26 @@ class DatabaseServiceClass {
     return null;
   }
 
+  async getUserById(id: number, eventId: number): Promise<User | null> {
+    if (!this.database) throw new Error('Database not initialized');
+    const result = await this.database.getFirstAsync(
+      'SELECT * FROM users WHERE id = ? AND event_id = ? AND is_active = 1',
+      [id, eventId]
+    ) as any;
+    if (!result) return null;
+    return {
+      id: result.id,
+      email: result.email,
+      name: result.name,
+      phone: result.phone,
+      event_id: result.event_id,
+      assignments: JSON.parse(result.assignments || '[]'),
+      access_level: result.access_level,
+      allowed_areas: JSON.parse(result.allowed_areas),
+      is_active: result.is_active === 1,
+    };
+  }
+
   async logScan(scanLog: Omit<ScanLog, 'id'>): Promise<void> {
     if (!this.database) {
       throw new Error('Database not initialized');
@@ -1020,7 +1118,176 @@ class DatabaseServiceClass {
     return row?.qr_authority_public_key ?? null;
   }
 
-  async verifyQRCode(qrData: string, area: string, eventId: number): Promise<{ success: boolean; user?: User; reason?: string }> {
+  async stageQrTrustPage(page: QrTrustPage, reset: boolean): Promise<void> {
+    if (!this.database) throw new Error('Database not initialized');
+    if (
+      page.contract_version !== 'qr-trust-v1' ||
+      !Number.isSafeInteger(page.event_id) ||
+      !Number.isSafeInteger(page.snapshot_generation) ||
+      page.snapshot_generation < 0 ||
+      !Number.isFinite(Date.parse(page.generated_at)) ||
+      !Number.isFinite(Date.parse(page.hard_expires_at)) ||
+      Date.parse(page.hard_expires_at) <= Date.parse(page.generated_at) ||
+      !/^[a-f0-9]{64}$/.test(page.checksum) ||
+      !Array.isArray(page.authority_keys) ||
+      !Array.isArray(page.revocations)
+    ) throw new Error('Invalid QR trust page');
+    for (const key of page.authority_keys) {
+      if (
+        !/^[A-Za-z0-9._-]{1,32}$/.test(key.kid) ||
+        !/^[A-Za-z0-9_-]{87}$/.test(key.public_key) ||
+        !['active', 'retiring'].includes(key.status) ||
+        (key.verify_until != null && !Number.isSafeInteger(key.verify_until))
+      ) throw new Error('Invalid QR authority key');
+    }
+    const commands: Parameters<SQLite.SQLiteDatabase['executeBatchAsync']>[0] = [];
+    if (reset) {
+      commands.push(
+        ['DELETE FROM qr_trust_stage_metadata WHERE event_id = ?', [page.event_id]],
+        ['DELETE FROM qr_trust_stage_keys WHERE event_id = ?', [page.event_id]],
+        ['DELETE FROM qr_trust_stage_revocations WHERE event_id = ?', [page.event_id]],
+        [
+          `INSERT INTO qr_trust_stage_metadata
+             (event_id, generation, generated_at, hard_expires_at, checksum)
+           VALUES (?, ?, ?, ?, ?)`,
+          [
+            page.event_id,
+            page.snapshot_generation,
+            page.generated_at,
+            page.hard_expires_at,
+            page.checksum,
+          ],
+        ]
+      );
+      for (const key of page.authority_keys) {
+        commands.push([
+          `INSERT INTO qr_trust_stage_keys
+             (event_id, kid, public_key, status, verify_until)
+           VALUES (?, ?, ?, ?, ?)`,
+          [page.event_id, key.kid, key.public_key, key.status, key.verify_until],
+        ]);
+      }
+    }
+    for (const revocation of page.revocations) {
+      if (
+        !Number.isSafeInteger(revocation.generation) ||
+        revocation.generation <= 0 ||
+        revocation.generation > page.snapshot_generation ||
+        (revocation.credential_id != null &&
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(revocation.credential_id)) ||
+        typeof revocation.device_id !== 'string' ||
+        revocation.device_id.length < 1 ||
+        revocation.device_id.length > 64 ||
+        (revocation.registration_generation != null &&
+          (!Number.isSafeInteger(revocation.registration_generation) ||
+            revocation.registration_generation <= 0))
+      ) {
+        throw new Error('Invalid QR trust revocation');
+      }
+      commands.push([
+        `INSERT OR REPLACE INTO qr_trust_stage_revocations
+           (event_id, generation, credential_id, device_id, registration_generation)
+         VALUES (?, ?, ?, ?, ?)`,
+        [
+          page.event_id,
+          revocation.generation,
+          revocation.credential_id,
+          revocation.device_id,
+          revocation.registration_generation,
+        ],
+      ]);
+    }
+    await this.database.executeBatchAsync(commands);
+  }
+
+  async promoteQrTrustSnapshot(eventId: number, generation: number): Promise<void> {
+    if (!this.database) throw new Error('Database not initialized');
+    const stage = await this.database.getFirstAsync(
+      `SELECT generation FROM qr_trust_stage_metadata
+       WHERE event_id = ? AND generation = ?`,
+      [eventId, generation]
+    ) as { generation: number } | null;
+    if (!stage) throw new Error('Complete QR trust stage is unavailable');
+    await this.database.executeBatchAsync([
+      ['DELETE FROM qr_authority_keys WHERE event_id = ?', [eventId]],
+      ['DELETE FROM qr_revocations WHERE event_id = ?', [eventId]],
+      [
+        `INSERT INTO qr_authority_keys
+           (event_id, kid, public_key, status, verify_until)
+         SELECT event_id, kid, public_key, status, verify_until
+         FROM qr_trust_stage_keys WHERE event_id = ?`,
+        [eventId],
+      ],
+      [
+        `INSERT INTO qr_revocations
+           (event_id, generation, credential_id, device_id, registration_generation)
+         SELECT event_id, generation, credential_id, device_id, registration_generation
+         FROM qr_trust_stage_revocations WHERE event_id = ?`,
+        [eventId],
+      ],
+      [
+        `INSERT INTO qr_trust_metadata
+           (event_id, generation, generated_at, hard_expires_at, checksum, promoted_at)
+         SELECT event_id, generation, generated_at, hard_expires_at, checksum, ?
+         FROM qr_trust_stage_metadata WHERE event_id = ?
+         ON CONFLICT(event_id) DO UPDATE SET
+           generation = excluded.generation,
+           generated_at = excluded.generated_at,
+           hard_expires_at = excluded.hard_expires_at,
+           checksum = excluded.checksum,
+           promoted_at = excluded.promoted_at`,
+        [new Date().toISOString(), eventId],
+      ],
+      ['DELETE FROM qr_trust_stage_metadata WHERE event_id = ?', [eventId]],
+      ['DELETE FROM qr_trust_stage_keys WHERE event_id = ?', [eventId]],
+      ['DELETE FROM qr_trust_stage_revocations WHERE event_id = ?', [eventId]],
+    ]);
+  }
+
+  async getQrTrustMaterial(eventId: number): Promise<QrTrustMaterial | null> {
+    if (!this.database) throw new Error('Database not initialized');
+    const metadata = await this.database.getFirstAsync(
+      `SELECT generation, generated_at, hard_expires_at
+       FROM qr_trust_metadata WHERE event_id = ?`,
+      [eventId]
+    ) as { generation: number; generated_at: string; hard_expires_at: string } | null;
+    if (!metadata) return null;
+    const keys = await this.database.getAllAsync(
+      `SELECT kid, public_key, status, verify_until
+       FROM qr_authority_keys WHERE event_id = ? ORDER BY kid`,
+      [eventId]
+    );
+    const revocations = await this.database.getAllAsync(
+      `SELECT generation, credential_id, device_id, registration_generation
+       FROM qr_revocations WHERE event_id = ? ORDER BY generation`,
+      [eventId]
+    ) as any[];
+    return {
+      generation: Number(metadata.generation),
+      generated_at: metadata.generated_at,
+      hard_expires_at: metadata.hard_expires_at,
+      authority_keys: keys as QrTrustMaterial['authority_keys'],
+      revocations: revocations.map((row) => ({
+        ...row,
+        generation: Number(row.generation),
+        registration_generation: row.registration_generation == null
+          ? null
+          : Number(row.registration_generation),
+      })),
+      legacy_authority_public_key: await this.getQrAuthorityPublicKey(eventId),
+    };
+  }
+
+  async verifyQRCode(qrData: string, area: string, eventId: number): Promise<{
+    success: boolean;
+    user?: User;
+    reason?: string;
+    code?: string;
+    conclusive?: boolean;
+    credential_id?: string;
+    nonce_hash?: string;
+    trust_freshness?: 'current' | 'stale' | 'expired';
+  }> {
     try {
       const parsedData = JSON.parse(qrData);
       if (DEMO_MODE && parsedData?.version === 'verigate-demo-v1' && parsedData.demo === true) {
@@ -1034,38 +1301,76 @@ class DatabaseServiceClass {
           : { success: false, user, reason: `No access to ${area}` };
       }
 
-      const authorityKey = await this.getQrAuthorityPublicKey(eventId);
-      if (!authorityKey) return { success: false, reason: 'Trusted event QR authority unavailable; sync required' };
+      const trust = await this.getQrTrustMaterial(eventId);
+      const authorityKey = trust ? null : await this.getQrAuthorityPublicKey(eventId);
+      if (!trust && !authorityKey) return { success: false, conclusive: false, code: 'trust_snapshot_missing', reason: 'Trusted event QR authority unavailable; sync required' };
 
-      const verification = await QrCredentialService.verify(qrData, eventId, authorityKey);
+      const verification = trust
+        ? await QrCredentialService.verifyWithTrust(qrData, eventId, trust)
+        : await QrCredentialService.verify(qrData, eventId, authorityKey!);
       if (!verification.valid || !verification.presentation) {
-        return { success: false, reason: verification.reason ?? 'Invalid QR credential' };
+        return {
+          success: false,
+          reason: verification.reason ?? 'Invalid QR credential',
+          code: verification.code,
+          conclusive: verification.conclusive,
+          trust_freshness: verification.trust_freshness,
+        };
       }
 
-      const user = await this.getUserByEmail(verification.presentation.email, eventId);
+      const user = verification.presentation.protocol === 3
+        ? await this.getUserById(verification.presentation.user_id, eventId)
+        : await this.getUserByEmail(verification.presentation.email, eventId);
       if (!user || user.id !== verification.presentation.user_id) {
-        return { success: false, reason: 'Credential holder is not active in this event' };
+        return {
+          success: false,
+          reason: 'Credential holder is not active in this event',
+          code: 'subject_snapshot_missing',
+          conclusive: false,
+          credential_id: verification.presentation.credential_id,
+          nonce_hash: verification.presentation.nonce_hash,
+          trust_freshness: verification.trust_freshness,
+        };
       }
 
       const now = Date.now();
-      const signedAssignment = verification.presentation.assignments.find((assignment) =>
-        hasCompleteAccessResourceProjection(assignment) &&
-        assignment.area_name === area &&
-        new Date(assignment.valid_from).getTime() <= now &&
-        new Date(assignment.valid_until).getTime() >= now
-      );
+      const signedAssignment = verification.presentation.protocol === 3
+        ? undefined
+        : verification.presentation.assignments.find((assignment) =>
+          hasCompleteAccessResourceProjection(assignment) &&
+          assignment.area_name === area &&
+          new Date(assignment.valid_from).getTime() <= now &&
+          new Date(assignment.valid_until).getTime() >= now
+        );
       const localAssignment = (user.assignments ?? []).find((assignment) =>
         hasCompleteAccessResourceProjection(assignment) &&
-        assignment.area_id === signedAssignment?.area_id &&
+        (verification.presentation!.protocol === 3 || assignment.area_id === signedAssignment?.area_id) &&
         assignment.area_name === area &&
         new Date(assignment.valid_from).getTime() <= now &&
         new Date(assignment.valid_until).getTime() >= now
       );
-      if (!signedAssignment || !localAssignment) {
-        return { success: false, user, reason: `No current access assignment for ${area}` };
+      if ((verification.presentation.protocol !== 3 && !signedAssignment) || !localAssignment) {
+        return {
+          success: false,
+          user,
+          reason: `No current access assignment for ${area}`,
+          code: 'assignment_snapshot_missing',
+          conclusive: false,
+          credential_id: verification.presentation.credential_id,
+          nonce_hash: verification.presentation.nonce_hash,
+          trust_freshness: verification.trust_freshness,
+        };
       }
 
-      return { success: true, user };
+      return {
+        success: true,
+        user,
+        code: 'access_granted',
+        conclusive: verification.conclusive,
+        credential_id: verification.presentation.credential_id,
+        nonce_hash: verification.presentation.nonce_hash,
+        trust_freshness: verification.trust_freshness,
+      };
     } catch {
       return { success: false, reason: 'Invalid QR code data' };
     }

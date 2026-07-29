@@ -13,7 +13,7 @@ jest.mock('expo-crypto', () => ({
 }));
 jest.mock('../../config', () => ({ DEMO_MODE: false }));
 jest.mock('../QrCredentialService', () => ({
-  QrCredentialService: { verify: jest.fn() },
+  QrCredentialService: { verify: jest.fn(), verifyWithTrust: jest.fn() },
 }));
 
 import * as SecureStore from 'expo-secure-store';
@@ -322,6 +322,63 @@ describe('DatabaseService event-scoped users', () => {
     expect(database.runAsync.mock.calls[1][1]?.slice(2)).toEqual([1, 2]);
   });
 
+  it('stages trust by event and promotes it through one atomic replacement batch', async () => {
+    const database = createDatabaseDouble();
+    database.getFirstAsync.mockResolvedValueOnce({ generation: 8 });
+    service.database = database;
+    const page = {
+      contract_version: 'qr-trust-v1' as const,
+      event_id: 11,
+      snapshot_generation: 8,
+      generated_at: '2026-07-29T00:00:00.000Z',
+      hard_expires_at: '2026-07-30T00:00:00.000Z',
+      authority_keys: [{
+        kid: 'qr-2026-01',
+        public_key: 'BGsX0fLhLEJH-Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU',
+        status: 'active' as const,
+        verify_until: null,
+      }],
+      revocations: [{
+        generation: 8,
+        credential_id: '00112233-4455-6677-8899-aabbccddeeff',
+        user_id: 5,
+        device_id: 'pass-device-1',
+        registration_generation: 3,
+        credential_expires_at: '2026-07-30T00:00:00.000Z',
+        revoked_at: '2026-07-29T00:00:00.000Z',
+        reason: 'credential-replaced',
+      }],
+      has_more: false,
+      next_cursor: 'cursor-8',
+      checksum: 'a'.repeat(64),
+    };
+
+    await DatabaseService.stageQrTrustPage(page, true);
+    await DatabaseService.promoteQrTrustSnapshot(11, 8);
+
+    const stageCommands = database.executeBatchAsync.mock.calls[0][0];
+    expect(stageCommands.slice(0, 3)).toEqual([
+      ['DELETE FROM qr_trust_stage_metadata WHERE event_id = ?', [11]],
+      ['DELETE FROM qr_trust_stage_keys WHERE event_id = ?', [11]],
+      ['DELETE FROM qr_trust_stage_revocations WHERE event_id = ?', [11]],
+    ]);
+    expect(stageCommands.every(([, params]) => !params || params.includes(11))).toBe(true);
+
+    expect(database.getFirstAsync).toHaveBeenCalledWith(
+      expect.stringContaining('qr_trust_stage_metadata'),
+      [11, 8]
+    );
+    const promotionCommands = database.executeBatchAsync.mock.calls[1][0];
+    expect(promotionCommands[0]).toEqual(['DELETE FROM qr_authority_keys WHERE event_id = ?', [11]]);
+    expect(promotionCommands[1]).toEqual(['DELETE FROM qr_revocations WHERE event_id = ?', [11]]);
+    expect(promotionCommands.map(([sql]) => compact(sql))).toEqual(expect.arrayContaining([
+      expect.stringContaining('INSERT INTO qr_trust_metadata'),
+      'DELETE FROM qr_trust_stage_metadata WHERE event_id = ?',
+      'DELETE FROM qr_trust_stage_keys WHERE event_id = ?',
+      'DELETE FROM qr_trust_stage_revocations WHERE event_id = ?',
+    ]));
+  });
+
   it('denies signed or local assignments whose active-resource projection is incomplete', async () => {
     const now = Date.now();
     const assignment = {
@@ -336,6 +393,7 @@ describe('DatabaseService event-scoped users', () => {
     for (const incompleteProjection of ['signed', 'local'] as const) {
       const database = createDatabaseDouble();
       database.getFirstAsync
+        .mockResolvedValueOnce(null)
         .mockResolvedValueOnce({ qr_authority_public_key: 'trusted-key' })
         .mockResolvedValueOnce({
           ...user(5),

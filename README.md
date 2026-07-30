@@ -23,13 +23,32 @@ The mobile app scanners/staff use to verify attendee QR codes offline against a 
 - **Emergency / manual override**: security/admin-role scanners can grant or deny access outside the normal QR flow with a mandatory logged reason, synced to the backend and reviewable on the dashboard.
 - **Incident reporting**: flag suspicious activity or technical issues from the scan screen; synced to the backend's incident queue.
 - **Multi-user, role-aware UI**: multiple scanner accounts can log in/out on one device (quick-login list); security/admin roles see an extra "Emergency Override" action volunteers don't.
-- **Foreground event sync**: production login authenticates against the backend, pulls complete user/area snapshots, retains complete per-area assignments and the trusted event QR authority, and uploads each queue under its immutable originating event. The foreground scheduler uses a nominal 10-second cadence with bounded backoff/jitter; background execution is unsupported and manual feedback remains available. Blank-password local data is available only when `EXPO_PUBLIC_DEMO_MODE=true`.
+- **Foreground event sync**: account authority selects and persists the event
+  before device-session exchange. Later synchronization uses only the signed
+  registration event and does not call account-only `/events`. Complete QR
+  trust, users, areas, and active-cycle metadata promote in one SQLite
+  transaction, so authorization readers observe the whole previous or whole
+  new cycle. Requests and refresh have bounded deadlines and preserve
+  idempotency keys across safe retries. The foreground scheduler uses a nominal
+  10-second cadence with bounded backoff/jitter; background execution is
+  unsupported and manual feedback remains available. Blank-password local data
+  is available only when `EXPO_PUBLIC_DEMO_MODE=true`.
 - **Installation-bound sessions and revocation**: production login exchanges the account session for a Scan registration scoped to one event and installation. Connected launch, resume, scheduler, scanner, and upload paths enforce that registration and show a durable re-login notice after revocation. Blacklisting stops scanning and performs no final upload. Deregistration stops new records and may use a server-issued 15-minute audit credential only for acknowledged scan, incident, and override records whose occurrence time is at or before the authoritative deregistration cutoff; ineligible or unacknowledged rows remain inspectable locally.
 - **Revocable logout**: manual logout attempts server-side family revocation,
   then clears local tokens, queues' active authority, and UI state even if the
   network request fails.
 
-- **Durable queue acknowledgements**: scans, incidents, and overrides preserve client record IDs, originating events, bounded evidence, and occurrence times. Incident/override uploads process at most two batches of ten per foreground cycle. Accepted/known-duplicate records become synced, structured terminal rejections remain retained with bounded error metadata, and authentication/transient failures remain pending and stop safely.
+- **Durable queue acknowledgements**: scans, incidents, and overrides preserve
+  client record IDs, originating events, bounded evidence, and occurrence
+  times. Active scan selection is event- and retry-time-qualified. Every scan
+  acknowledgement records attempts, next retry, terminal reason, server ID,
+  and acknowledgement time as applicable; terminal poison rows remain locally
+  inspectable without blocking later eligible rows. Incident/override uploads
+  process at most two batches of ten per foreground cycle.
+- **Event-transition recovery**: moving a Scan registration to a new event
+  quarantines unauthorized old-event work and drains eligible prior-event rows
+  only with a separately signed cutoff/deadline audit credential. Blacklisted,
+  expired, or post-cutoff work receives no audit authority.
 - **Installation-qualified legacy identities**: one SecureStore-backed installation identity is shared by heartbeat and migration of pending rows that never received a client identity. It remains stable across restarts; newly queued records continue to use random UUIDs. A build that finds an already-assigned weak `legacy-incident-<row>` or `legacy-override-<row>` identity stops before changing it because a lost upload acknowledgement cannot be distinguished locally from a never-uploaded row.
 - **Sync-stale local warning**: a local notification (`expo-notifications`) fires if the device hasn't synced recently - there is no remote push in this app by design (scanners are expected to be actively at the device).
 

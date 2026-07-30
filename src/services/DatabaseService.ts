@@ -63,6 +63,15 @@ export interface ScanLog {
   trust_generation?: number | null;
   user_snapshot_at?: string | null;
   scanner_installation_id?: string | null;
+  upload_state?: 'pending' | 'processing' | 'acknowledged' | 'retryable' | 'terminal' | 'quarantined';
+  attempt_count?: number;
+  last_attempt_at?: string | null;
+  next_attempt_at?: string | null;
+  last_error_code?: string | null;
+  last_error?: string | null;
+  acknowledged_at?: string | null;
+  server_id?: number | null;
+  terminal_reason?: string | null;
 }
 
 export interface QueuedIncident {
@@ -272,7 +281,16 @@ class DatabaseServiceClass {
         trust_generation INTEGER,
         user_snapshot_at TEXT,
         scanner_installation_id TEXT,
-        synced INTEGER DEFAULT 0
+        synced INTEGER DEFAULT 0,
+        upload_state TEXT NOT NULL DEFAULT 'pending',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at TEXT,
+        next_attempt_at TEXT,
+        last_error_code TEXT,
+        last_error TEXT,
+        acknowledged_at TEXT,
+        server_id INTEGER,
+        terminal_reason TEXT
       );
     `);
 
@@ -391,6 +409,23 @@ class DatabaseServiceClass {
     await this.migrateUsersToEventScopedIdentity();
     await this.addColumnIfMissing('scan_logs', 'event_id', 'INTEGER NOT NULL DEFAULT 0');
     await this.migrateScanLogsToDecisionEvidence();
+    await this.addColumnIfMissing('scan_logs', 'upload_state', "TEXT NOT NULL DEFAULT 'pending'");
+    await this.addColumnIfMissing('scan_logs', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
+    await this.addColumnIfMissing('scan_logs', 'last_attempt_at', 'TEXT');
+    await this.addColumnIfMissing('scan_logs', 'next_attempt_at', 'TEXT');
+    await this.addColumnIfMissing('scan_logs', 'last_error_code', 'TEXT');
+    await this.addColumnIfMissing('scan_logs', 'last_error', 'TEXT');
+    await this.addColumnIfMissing('scan_logs', 'acknowledged_at', 'TEXT');
+    await this.addColumnIfMissing('scan_logs', 'server_id', 'INTEGER');
+    await this.addColumnIfMissing('scan_logs', 'terminal_reason', 'TEXT');
+    await this.database.execAsync(`
+      UPDATE scan_logs
+      SET upload_state = CASE WHEN synced = 1 THEN 'acknowledged' ELSE 'pending' END
+      WHERE upload_state IS NULL
+         OR upload_state NOT IN ('pending', 'processing', 'acknowledged', 'retryable', 'terminal', 'quarantined');
+      CREATE INDEX IF NOT EXISTS idx_scan_logs_upload_eligibility
+        ON scan_logs(event_id, upload_state, next_attempt_at, id);
+    `);
     await this.addColumnIfMissing('incidents_queue', 'client_record_id', 'TEXT');
     await this.addColumnIfMissing('incidents_queue', 'occurred_at', 'TEXT');
     await this.addColumnIfMissing('incidents_queue', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
@@ -934,6 +969,101 @@ class DatabaseServiceClass {
     await this.recordIntegrityChecksum();
   }
 
+  async promoteAuthorizationSnapshot(input: {
+    eventId: number;
+    trustGeneration: number;
+    users: User[];
+    areas: { id: number; name: string; requires_scan: boolean }[];
+    legacyAuthorityPublicKey: string;
+  }): Promise<void> {
+    if (!this.database) throw new Error('Database not initialized');
+    const stage = await this.database.getFirstAsync(
+      `SELECT generation FROM qr_trust_stage_metadata
+       WHERE event_id = ? AND generation = ?`,
+      [input.eventId, input.trustGeneration]
+    ) as { generation: number } | null;
+    if (!stage) throw new Error('Complete authorization snapshot stage is unavailable');
+
+    const commands: Parameters<SQLite.SQLiteDatabase['executeBatchAsync']>[0] = [
+      ['DELETE FROM users WHERE event_id = ?', [input.eventId]],
+      ['DELETE FROM synced_areas WHERE event_id = ?', [input.eventId]],
+      ['DELETE FROM qr_authority_keys WHERE event_id = ?', [input.eventId]],
+      ['DELETE FROM qr_revocations WHERE event_id = ?', [input.eventId]],
+    ];
+    for (const user of input.users) {
+      if (user.event_id != null && user.event_id !== input.eventId) {
+        throw new Error(`Synchronized user ${user.id} belongs to event ${user.event_id}, not ${input.eventId}`);
+      }
+      const assignments = user.assignments ?? [];
+      const strongest = [...assignments].sort((left, right) => right.access_priority - left.access_priority)[0];
+      const allowedAreas = [...new Set(assignments.map((assignment) => assignment.area_name))];
+      commands.push([
+        `INSERT INTO users
+           (id, email, name, phone, event_id, assignments, access_level, allowed_areas, is_active)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          user.id,
+          user.email,
+          user.name,
+          user.phone,
+          input.eventId,
+          JSON.stringify(assignments),
+          strongest?.access_level_name ?? user.access_level ?? 'Unassigned',
+          JSON.stringify(allowedAreas),
+          user.is_active ? 1 : 0,
+        ],
+      ]);
+    }
+    for (const area of input.areas) {
+      commands.push([
+        `INSERT INTO synced_areas (id, event_id, name, requires_scan)
+         VALUES (?, ?, ?, ?)`,
+        [area.id, input.eventId, area.name, area.requires_scan ? 1 : 0],
+      ]);
+    }
+    commands.push(
+      [
+        `INSERT INTO qr_authority_keys (event_id, kid, public_key, status, verify_until)
+         SELECT event_id, kid, public_key, status, verify_until
+         FROM qr_trust_stage_keys WHERE event_id = ?`,
+        [input.eventId],
+      ],
+      [
+        `INSERT INTO qr_revocations
+           (event_id, generation, credential_id, device_id, registration_generation)
+         SELECT event_id, generation, credential_id, device_id, registration_generation
+         FROM qr_trust_stage_revocations WHERE event_id = ?`,
+        [input.eventId],
+      ],
+      [
+        `INSERT INTO qr_trust_metadata
+           (event_id, generation, generated_at, hard_expires_at, checksum, promoted_at)
+         SELECT event_id, generation, generated_at, hard_expires_at, checksum, ?
+         FROM qr_trust_stage_metadata WHERE event_id = ?
+         ON CONFLICT(event_id) DO UPDATE SET
+           generation = excluded.generation,
+           generated_at = excluded.generated_at,
+           hard_expires_at = excluded.hard_expires_at,
+           checksum = excluded.checksum,
+           promoted_at = excluded.promoted_at`,
+        [new Date().toISOString(), input.eventId],
+      ],
+      [
+        `INSERT INTO sync_metadata (event_id, qr_authority_public_key, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(event_id) DO UPDATE SET
+           qr_authority_public_key = excluded.qr_authority_public_key,
+           updated_at = excluded.updated_at`,
+        [input.eventId, input.legacyAuthorityPublicKey, new Date().toISOString()],
+      ],
+      ['DELETE FROM qr_trust_stage_metadata WHERE event_id = ?', [input.eventId]],
+      ['DELETE FROM qr_trust_stage_keys WHERE event_id = ?', [input.eventId]],
+      ['DELETE FROM qr_trust_stage_revocations WHERE event_id = ?', [input.eventId]],
+    );
+    await this.database.executeBatchAsync(commands);
+    await this.recordIntegrityChecksum();
+  }
+
   /**
    * Upserts a real backend account (role 'scanner' or 'admin') into the
    * local scanner_users table by its real numeric id, so a genuine operator
@@ -988,13 +1118,18 @@ class DatabaseServiceClass {
     return result.map((row) => ({ id: row.id, name: row.name }));
   }
 
-  async getUnsyncedScanLogs(limit = 25): Promise<(ScanLog & { id: number })[]> {
+  async getUnsyncedScanLogs(limit = 25, eventId?: number): Promise<(ScanLog & { id: number })[]> {
     if (!this.database) {
       throw new Error('Database not initialized');
     }
     const result = (await this.database.getAllAsync(
-      'SELECT * FROM scan_logs WHERE synced = 0 ORDER BY id ASC LIMIT ?',
-      [limit]
+      `SELECT * FROM scan_logs
+       WHERE synced = 0
+         AND upload_state IN ('pending', 'retryable')
+         AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+         AND (? IS NULL OR event_id = ?)
+       ORDER BY id ASC LIMIT ?`,
+      [new Date().toISOString(), eventId ?? null, eventId ?? null, limit]
     )) as any[];
     return result.map((row) => ({
       id: row.id,
@@ -1015,14 +1150,28 @@ class DatabaseServiceClass {
       trust_generation: row.trust_generation,
       user_snapshot_at: row.user_snapshot_at,
       scanner_installation_id: row.scanner_installation_id,
+      upload_state: row.upload_state,
+      attempt_count: Number(row.attempt_count || 0),
+      last_attempt_at: row.last_attempt_at,
+      next_attempt_at: row.next_attempt_at,
+      last_error_code: row.last_error_code,
+      last_error: row.last_error,
+      acknowledged_at: row.acknowledged_at,
+      server_id: row.server_id,
+      terminal_reason: row.terminal_reason,
     }));
   }
 
-  async getEligibleAuditScanLogs(cutoff: string, limit = 25): Promise<(ScanLog & { id: number })[]> {
+  async getEligibleAuditScanLogs(eventId: number, cutoff: string, limit = 25): Promise<(ScanLog & { id: number })[]> {
     if (!this.database) throw new Error('Database not initialized');
     const rows = (await this.database.getAllAsync(
-      'SELECT * FROM scan_logs WHERE synced = 0 AND scanned_at <= ? ORDER BY id ASC LIMIT ?',
-      [cutoff, limit]
+      `SELECT * FROM scan_logs
+       WHERE event_id = ?
+         AND synced = 0
+         AND upload_state IN ('pending', 'retryable')
+         AND scanned_at <= ?
+       ORDER BY id ASC LIMIT ?`,
+      [eventId, cutoff, limit]
     )) as any[];
     return rows.map((row) => ({
       id: row.id,
@@ -1049,15 +1198,109 @@ class DatabaseServiceClass {
   async markScanLogsSynced(ids: number[]): Promise<void> {
     if (!this.database || ids.length === 0) return;
     const placeholders = ids.map(() => '?').join(',');
-    await this.database.runAsync(`UPDATE scan_logs SET synced = 1 WHERE id IN (${placeholders})`, ids);
+    await this.database.runAsync(
+      `UPDATE scan_logs
+       SET synced = 1,
+           upload_state = 'acknowledged',
+           acknowledged_at = COALESCE(acknowledged_at, ?),
+           next_attempt_at = NULL,
+           last_error_code = NULL,
+           last_error = NULL
+       WHERE id IN (${placeholders})`,
+      [new Date().toISOString(), ...ids]
+    );
   }
 
   async markScanLogSyncedByDeviceId(deviceScanId: string): Promise<void> {
     if (!this.database) return;
     await this.database.runAsync(
-      'UPDATE scan_logs SET synced = 1 WHERE device_scan_id = ?',
-      [deviceScanId]
+      `UPDATE scan_logs
+       SET synced = 1, upload_state = 'acknowledged',
+           acknowledged_at = COALESCE(acknowledged_at, ?),
+           next_attempt_at = NULL
+       WHERE device_scan_id = ?`,
+      [new Date().toISOString(), deviceScanId]
     );
+  }
+
+  async recordScanUploadOutcomes(outcomes: {
+    id: number;
+    status: 'accepted' | 'duplicate' | 'rejected' | 'retryable_error';
+    error?: string;
+    serverId?: number;
+  }[]): Promise<void> {
+    if (!this.database || outcomes.length === 0) return;
+    const now = new Date();
+    const commands: Parameters<SQLite.SQLiteDatabase['executeBatchAsync']>[0] = [];
+    for (const outcome of outcomes) {
+      const error = outcome.error?.slice(0, MAX_QUEUE_ERROR_LENGTH) ?? null;
+      if (outcome.status === 'accepted' || outcome.status === 'duplicate') {
+        commands.push([
+          `UPDATE scan_logs
+           SET synced = 1, upload_state = 'acknowledged',
+               attempt_count = attempt_count + 1, last_attempt_at = ?,
+               acknowledged_at = ?, server_id = ?, next_attempt_at = NULL,
+               last_error_code = NULL, last_error = NULL, terminal_reason = NULL
+           WHERE id = ?`,
+          [now.toISOString(), now.toISOString(), outcome.serverId ?? null, outcome.id],
+        ]);
+      } else if (outcome.status === 'rejected') {
+        commands.push([
+          `UPDATE scan_logs
+           SET upload_state = 'terminal', attempt_count = attempt_count + 1,
+               last_attempt_at = ?, next_attempt_at = NULL,
+               last_error_code = 'REJECTED', last_error = ?, terminal_reason = ?
+           WHERE id = ?`,
+          [now.toISOString(), error, error ?? 'Backend rejected this audit record', outcome.id],
+        ]);
+      } else {
+        const row = await this.database.getFirstAsync(
+          'SELECT attempt_count FROM scan_logs WHERE id = ?',
+          [outcome.id]
+        ) as { attempt_count?: number } | null;
+        const attempt = Number(row?.attempt_count || 0) + 1;
+        const delayMs = Math.min(60_000, 1_000 * (2 ** Math.min(attempt - 1, 6)));
+        commands.push([
+          `UPDATE scan_logs
+           SET upload_state = 'retryable', attempt_count = attempt_count + 1,
+               last_attempt_at = ?, next_attempt_at = ?,
+               last_error_code = 'RETRYABLE', last_error = ?
+           WHERE id = ?`,
+          [now.toISOString(), new Date(now.getTime() + delayMs).toISOString(), error, outcome.id],
+        ]);
+      }
+    }
+    await this.database.executeBatchAsync(commands);
+  }
+
+  async quarantineEventScanLogs(eventId: number, reason: string): Promise<void> {
+    if (!this.database) throw new Error('Database not initialized');
+    const boundedReason = reason.slice(0, MAX_QUEUE_ERROR_LENGTH);
+    await this.database.executeBatchAsync([
+      [
+        `UPDATE scan_logs
+         SET upload_state = 'quarantined',
+             next_attempt_at = NULL,
+             terminal_reason = ?,
+             last_error_code = 'AUDIT_WINDOW_UNAVAILABLE',
+             last_error = ?
+         WHERE event_id = ? AND synced = 0
+           AND upload_state IN ('pending', 'retryable')`,
+        [boundedReason, boundedReason, eventId],
+      ],
+      [
+        `UPDATE incidents_queue
+         SET terminal_failure = 1, last_error = ?
+         WHERE event_id = ? AND synced = 0 AND terminal_failure = 0`,
+        [boundedReason, eventId],
+      ],
+      [
+        `UPDATE overrides_queue
+         SET terminal_failure = 1, last_error = ?
+         WHERE event_id = ? AND synced = 0 AND terminal_failure = 0`,
+        [boundedReason, eventId],
+      ],
+    ]);
   }
 
   async queueIncident(eventId: number, category: string, description: string, area?: string, areaId?: number): Promise<void> {
@@ -1082,13 +1325,13 @@ class DatabaseServiceClass {
     return rows.map((row) => ({ ...row, terminal_failure: row.terminal_failure === 1 }));
   }
 
-  async getEligibleAuditIncidents(cutoff: string, limit: number): Promise<QueuedIncident[]> {
+  async getEligibleAuditIncidents(eventId: number, cutoff: string, limit: number): Promise<QueuedIncident[]> {
     if (!this.database) throw new Error('Database not initialized');
     const rows = (await this.database.getAllAsync(
       `SELECT * FROM incidents_queue
-       WHERE synced = 0 AND terminal_failure = 0 AND occurred_at <= ?
+       WHERE event_id = ? AND synced = 0 AND terminal_failure = 0 AND occurred_at <= ?
        ORDER BY id ASC LIMIT ?`,
-      [cutoff, limit]
+      [eventId, cutoff, limit]
     )) as any[];
     return rows.map((row) => ({ ...row, terminal_failure: row.terminal_failure === 1 }));
   }
@@ -1141,13 +1384,13 @@ class DatabaseServiceClass {
     }));
   }
 
-  async getEligibleAuditOverrides(cutoff: string, limit: number): Promise<QueuedOverride[]> {
+  async getEligibleAuditOverrides(eventId: number, cutoff: string, limit: number): Promise<QueuedOverride[]> {
     if (!this.database) throw new Error('Database not initialized');
     const rows = (await this.database.getAllAsync(
       `SELECT * FROM overrides_queue
-       WHERE synced = 0 AND terminal_failure = 0 AND occurred_at <= ?
+       WHERE event_id = ? AND synced = 0 AND terminal_failure = 0 AND occurred_at <= ?
        ORDER BY id ASC LIMIT ?`,
-      [cutoff, limit]
+      [eventId, cutoff, limit]
     )) as any[];
     return rows.map((row) => ({
       ...row,

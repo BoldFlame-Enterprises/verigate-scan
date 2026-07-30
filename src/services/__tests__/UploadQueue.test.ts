@@ -25,7 +25,7 @@ jest.mock('../ApiClient', () => ({
 jest.mock('../DatabaseService', () => ({
   DatabaseService: {
     getUnsyncedScanLogs: jest.fn(),
-    markScanLogsSynced: jest.fn(async () => undefined),
+    recordScanUploadOutcomes: jest.fn(async () => undefined),
     getUnsyncedIncidents: jest.fn(async () => []),
     markIncidentsSynced: jest.fn(async () => undefined),
     recordIncidentFailure: jest.fn(async () => undefined),
@@ -99,26 +99,29 @@ describe('scan upload queue', () => {
     jest.clearAllMocks();
   });
 
-  it('partitions by stored event and acknowledges only accepted or duplicate rows', async () => {
+  it('uploads only the active event partition and records every acknowledgement state', async () => {
     jest.mocked(DatabaseService.getUnsyncedScanLogs).mockResolvedValue([
       record(1, 4),
       record(2, 4),
-      record(3, 5),
     ]);
-    jest.mocked(ApiClient.request).mockImplementation(async (_path: string, options: any) => ({
+    jest.mocked(ApiClient.request).mockImplementation(async (_path: string, _options: any) => ({
       contract_version: 'queue-ack-v2',
-      results: options.body.event_id === 4
-        ? [{ client_record_id: 'scan-1', status: 'accepted' }, { client_record_id: 'scan-2', status: 'retryable_error' }]
-        : [{ client_record_id: 'scan-3', status: 'duplicate' }],
+      results: [
+        { client_record_id: 'scan-1', status: 'accepted', server_id: 10 },
+        { client_record_id: 'scan-2', status: 'rejected', error: 'Invalid area' },
+      ],
     } as never));
 
-    const uploaded = await (SyncService as any).uploadQueuedScans();
+    const uploaded = await (SyncService as any).uploadQueuedScans(4);
 
-    expect(uploaded).toBe(2);
-    expect(ApiClient.request).toHaveBeenCalledTimes(2);
-    expect(jest.mocked(ApiClient.request).mock.calls.map((call) => (call[1] as any).body.event_id)).toEqual([4, 5]);
-    expect(DatabaseService.markScanLogsSynced).toHaveBeenNthCalledWith(1, [1]);
-    expect(DatabaseService.markScanLogsSynced).toHaveBeenNthCalledWith(2, [3]);
+    expect(uploaded).toBe(1);
+    expect(DatabaseService.getUnsyncedScanLogs).toHaveBeenCalledWith(25, 4);
+    expect(ApiClient.request).toHaveBeenCalledTimes(1);
+    expect((jest.mocked(ApiClient.request).mock.calls[0][1] as any).body.event_id).toBe(4);
+    expect(DatabaseService.recordScanUploadOutcomes).toHaveBeenCalledWith([
+      { id: 1, status: 'accepted', error: undefined, serverId: 10 },
+      { id: 2, status: 'rejected', error: 'Invalid area', serverId: undefined },
+    ]);
   });
 
   it('drains no more than four batches of 25 in one synchronization', async () => {
@@ -137,14 +140,20 @@ describe('scan upload queue', () => {
       })),
     } as never));
 
-    const uploaded = await (SyncService as any).uploadQueuedScans();
+    const uploaded = await (SyncService as any).uploadQueuedScans(4);
 
     expect(uploaded).toBe(100);
     expect(DatabaseService.getUnsyncedScanLogs).toHaveBeenCalledTimes(4);
-    expect(DatabaseService.getUnsyncedScanLogs).toHaveBeenCalledWith(25);
+    expect(DatabaseService.getUnsyncedScanLogs).toHaveBeenCalledWith(25, 4);
     expect(ApiClient.request).toHaveBeenCalledTimes(4);
-    expect(DatabaseService.markScanLogsSynced).toHaveBeenLastCalledWith(
-      Array.from({ length: 25 }, (_, index) => index + 76),
+    expect(DatabaseService.recordScanUploadOutcomes).toHaveBeenCalledTimes(4);
+    expect(DatabaseService.recordScanUploadOutcomes).toHaveBeenLastCalledWith(
+      Array.from({ length: 25 }, (_, index) => ({
+        id: index + 76,
+        status: 'accepted',
+        error: undefined,
+        serverId: undefined,
+      })),
     );
   });
 
@@ -160,18 +169,19 @@ describe('scan upload queue', () => {
       })),
     } as never));
 
-    const uploaded = await (SyncService as any).uploadQueuedScans();
+    const uploaded = await (SyncService as any).uploadQueuedScans(4);
 
     expect(uploaded).toBe(24);
     expect(DatabaseService.getUnsyncedScanLogs).toHaveBeenCalledTimes(1);
-    expect(DatabaseService.markScanLogsSynced).toHaveBeenCalledWith(
-      Array.from({ length: 24 }, (_, index) => index + 1),
+    expect(DatabaseService.recordScanUploadOutcomes).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        { id: 25, status: 'retryable_error', error: undefined, serverId: undefined },
+      ]),
     );
-    expect(DatabaseService.markScanLogsSynced).not.toHaveBeenCalledWith(expect.arrayContaining([25]));
   });
 
   it('stops without looping when a full batch makes no acknowledgement progress', async () => {
-    jest.mocked(DatabaseService.getUnsyncedScanLogs).mockResolvedValue(
+    jest.mocked(DatabaseService.getUnsyncedScanLogs).mockReset().mockResolvedValue(
       Array.from({ length: 25 }, (_, index) => record(index + 1)),
     );
     jest.mocked(ApiClient.request).mockImplementation(async (_path: string, options: any) => ({
@@ -182,11 +192,15 @@ describe('scan upload queue', () => {
       })),
     } as never));
 
-    const uploaded = await (SyncService as any).uploadQueuedScans();
+    const uploaded = await (SyncService as any).uploadQueuedScans(4);
 
     expect(uploaded).toBe(0);
     expect(DatabaseService.getUnsyncedScanLogs).toHaveBeenCalledTimes(1);
-    expect(DatabaseService.markScanLogsSynced).toHaveBeenCalledWith([]);
+    expect(DatabaseService.recordScanUploadOutcomes).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        { id: 1, status: 'rejected', error: undefined, serverId: undefined },
+      ]),
+    );
   });
 });
 
@@ -370,12 +384,14 @@ describe('deregistered audit queue', () => {
     } as never);
 
     await (SyncService as any).drainDeregisteredAuditQueues({
+      eventId: 4,
       cutoff: '2026-07-27T12:00:00.000Z',
       deadline: '2026-07-27T12:15:00.000Z',
       accessToken: 'audit-token',
     });
 
     expect(DatabaseService.getEligibleAuditScanLogs).toHaveBeenCalledWith(
+      4,
       '2026-07-27T12:00:00.000Z',
       25
     );
@@ -384,13 +400,16 @@ describe('deregistered audit queue', () => {
       '/sync/scan-logs',
       expect.objectContaining({ method: 'POST' })
     );
-    expect(DatabaseService.markScanLogsSynced).toHaveBeenCalledWith([1]);
+    expect(DatabaseService.recordScanUploadOutcomes).toHaveBeenCalledWith([
+      { id: 1, status: 'duplicate', error: undefined, serverId: undefined },
+    ]);
   });
 
   it('does not begin an audit upload after the deadline', async () => {
     jest.mocked(Date.now).mockReturnValue(new Date('2026-07-27T12:15:00.001Z').getTime());
 
     await (SyncService as any).drainDeregisteredAuditQueues({
+      eventId: 4,
       cutoff: '2026-07-27T12:00:00.000Z',
       deadline: '2026-07-27T12:15:00.000Z',
       accessToken: 'audit-token',

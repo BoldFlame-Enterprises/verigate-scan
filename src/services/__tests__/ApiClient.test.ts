@@ -28,6 +28,10 @@ describe('ApiClient token binding', () => {
     await ApiClient.clearTokens();
   });
 
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
   it('rotates on password login, survives refresh, and clears on logout', async () => {
     jest.mocked(global.fetch)
       .mockResolvedValueOnce(response(200, {
@@ -144,6 +148,9 @@ describe('ApiClient token binding', () => {
       'https://api.example.test/devices/session',
       expect.objectContaining({
         method: 'POST',
+        headers: expect.objectContaining({
+          'Idempotency-Key': 'scan-installation:scan:7',
+        }),
         body: JSON.stringify({
           event_id: 7,
           app: 'scan',
@@ -152,5 +159,30 @@ describe('ApiClient token binding', () => {
         }),
       }),
     ]);
+  });
+
+  it('releases a never-settling request at its deadline', async () => {
+    jest.mocked(global.fetch)
+      .mockResolvedValueOnce(response(200, {
+        success: true,
+        data: {
+          user: { id: 2, email: 'scanner@example.com', name: 'Scanner', phone: '1', role: 'scanner', is_active: true },
+          accessToken: 'access-1',
+          refreshToken: 'refresh-1',
+        },
+      }) as never)
+      .mockImplementationOnce(() => new Promise(() => undefined));
+    await ApiClient.login('scanner@example.com', 'password');
+    jest.useFakeTimers();
+
+    const pending = ApiClient.request('/sync/users-database', { timeoutMs: 50 });
+    const rejection = expect(pending).rejects.toMatchObject({
+      code: 'REQUEST_TIMEOUT',
+      kind: 'timeout',
+    });
+    await jest.advanceTimersByTimeAsync(50);
+
+    await rejection;
+    jest.useRealTimers();
   });
 });

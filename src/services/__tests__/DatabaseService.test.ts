@@ -386,6 +386,60 @@ describe('DatabaseService event-scoped users', () => {
     ]));
   });
 
+  it('promotes users, areas, trust, and metadata through one authorization transaction', async () => {
+    const database = createDatabaseDouble();
+    database.getFirstAsync.mockResolvedValueOnce({ generation: 8 });
+    service.database = database;
+
+    await DatabaseService.promoteAuthorizationSnapshot({
+      eventId: 11,
+      trustGeneration: 8,
+      users: [user(11)],
+      areas: [{ id: 3, name: 'Arena', requires_scan: true }],
+      legacyAuthorityPublicKey: 'legacy-public-key',
+    });
+
+    expect(database.executeBatchAsync).toHaveBeenCalledTimes(1);
+    const commands = database.executeBatchAsync.mock.calls[0][0];
+    expect(commands.slice(0, 4)).toEqual([
+      ['DELETE FROM users WHERE event_id = ?', [11]],
+      ['DELETE FROM synced_areas WHERE event_id = ?', [11]],
+      ['DELETE FROM qr_authority_keys WHERE event_id = ?', [11]],
+      ['DELETE FROM qr_revocations WHERE event_id = ?', [11]],
+    ]);
+    expect(commands.map(([sql]) => compact(sql))).toEqual(expect.arrayContaining([
+      expect.stringContaining('INSERT INTO users'),
+      expect.stringContaining('INSERT INTO synced_areas'),
+      expect.stringContaining('INSERT INTO qr_authority_keys'),
+      expect.stringContaining('INSERT INTO qr_revocations'),
+      expect.stringContaining('INSERT INTO qr_trust_metadata'),
+      expect.stringContaining('INSERT INTO sync_metadata'),
+      'DELETE FROM qr_trust_stage_metadata WHERE event_id = ?',
+      'DELETE FROM qr_trust_stage_keys WHERE event_id = ?',
+      'DELETE FROM qr_trust_stage_revocations WHERE event_id = ?',
+    ]));
+    expect(commands.every(([, params]) => !params || !params.includes(22))).toBe(true);
+    expect(SecureStore.setItemAsync).toHaveBeenCalled();
+  });
+
+  it('retains the old authorization snapshot and checksum when combined promotion fails', async () => {
+    const database = createDatabaseDouble();
+    database.getFirstAsync.mockResolvedValueOnce({ generation: 8 });
+    database.executeBatchAsync.mockRejectedValueOnce(new Error('injected promotion failure'));
+    service.database = database;
+
+    await expect(DatabaseService.promoteAuthorizationSnapshot({
+      eventId: 11,
+      trustGeneration: 8,
+      users: [user(11)],
+      areas: [{ id: 3, name: 'Arena', requires_scan: true }],
+      legacyAuthorityPublicKey: 'legacy-public-key',
+    })).rejects.toThrow('injected promotion failure');
+
+    expect(database.executeBatchAsync).toHaveBeenCalledTimes(1);
+    expect(SecureStore.setItemAsync).not.toHaveBeenCalled();
+  });
+
   it('records nullable-subject decision evidence without raw QR content and acknowledges by attempt id', async () => {
     const database = createDatabaseDouble();
     service.database = database;
@@ -436,8 +490,8 @@ describe('DatabaseService event-scoped users', () => {
     expect(JSON.stringify(database.runAsync.mock.calls[0])).not.toContain('qr_code');
     expect(database.runAsync).toHaveBeenNthCalledWith(
       2,
-      'UPDATE scan_logs SET synced = 1 WHERE device_scan_id = ?',
-      ['camera-attempt-1']
+      expect.stringContaining("upload_state = 'acknowledged'"),
+      [expect.any(String), 'camera-attempt-1']
     );
   });
 

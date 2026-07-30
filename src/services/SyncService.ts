@@ -14,6 +14,7 @@ import { DeviceIdentityService } from './DeviceIdentityService';
 
 const CURRENT_EVENT_ID_KEY = 'verigate_scan_event_id';
 const CURRENT_EVENT_NAME_KEY = 'verigate_scan_event_name';
+const CURRENT_EVENT_ENDS_AT_KEY = 'verigate_scan_event_ends_at';
 const LAST_SYNC_AT_KEY = 'verigate_scan_last_sync_at';
 
 interface RemoteEvent {
@@ -34,6 +35,7 @@ export interface SyncResult {
 }
 
 export interface DeregisteredAuditSession {
+  eventId: number;
   cutoff: string;
   deadline: string;
   accessToken: string;
@@ -45,6 +47,7 @@ interface QueueAckResponse {
     client_record_id: string;
     status: 'accepted' | 'duplicate' | 'rejected' | 'retryable_error';
     error?: string;
+    server_id?: number;
   }[];
 }
 
@@ -60,7 +63,7 @@ interface AuxiliaryUploadResult {
   error?: string;
 }
 
-/** Retries a flaky network call with exponential backoff for resilience. */
+/** Retries only bounded dependency failures; session and validation failures are terminal. */
 async function withBackoff<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
   let lastError: unknown;
   for (let i = 0; i < attempts; i++) {
@@ -68,6 +71,14 @@ async function withBackoff<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
       return await fn();
     } catch (error) {
       lastError = error;
+      if (
+        error instanceof ApiError &&
+        error.kind !== 'timeout' &&
+        error.kind !== 'network' &&
+        error.statusCode < 500
+      ) {
+        throw error;
+      }
       if (i < attempts - 1) {
         await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** i));
       }
@@ -131,20 +142,40 @@ class SyncServiceClass {
     return this.inFlight;
   }
 
+  async selectEvent(event: RemoteEvent): Promise<void> {
+    if (!Number.isSafeInteger(event.id) || event.id <= 0) {
+      throw new Error('Selected event is invalid');
+    }
+    await Promise.all([
+      SecureStore.setItemAsync(CURRENT_EVENT_ID_KEY, String(event.id)),
+      SecureStore.setItemAsync(CURRENT_EVENT_NAME_KEY, event.name),
+      event.ends_at
+        ? SecureStore.setItemAsync(CURRENT_EVENT_ENDS_AT_KEY, event.ends_at)
+        : SecureStore.deleteItemAsync(CURRENT_EVENT_ENDS_AT_KEY),
+    ]);
+  }
+
   private async performSync(): Promise<SyncResult> {
     try {
       if (!ApiClient.isAuthenticated()) {
         return { success: false, error: 'Not authenticated with backend' };
       }
 
-      const events = await withBackoff(() => ApiClient.request<RemoteEvent[]>('/events'));
-      if (events.length === 0) {
-        return { success: false, error: 'No events assigned to this scanner account yet' };
+      if (!ApiClient.hasDeviceSession()) {
+        return {
+          success: false,
+          error: 'Select an event with an account session before scanner synchronization',
+        };
       }
-
-      let eventId = await this.getCurrentEventId();
-      const event = events.find((e) => e.id === eventId) ?? events[0];
-      eventId = event.id;
+      const eventId = ApiClient.getDeviceEventId();
+      if (!eventId) {
+        return { success: false, error: 'Device session has no validated event binding' };
+      }
+      const event: RemoteEvent = {
+        id: eventId,
+        name: await this.getCurrentEventName() ?? `Event ${eventId}`,
+        ends_at: await SecureStore.getItemAsync(CURRENT_EVENT_ENDS_AT_KEY),
+      };
 
       const [usersData, areasData] = await Promise.all([
         withBackoff(() => ApiClient.request<{ contract_version: string; users: User[] }>('/sync/users-database', { params: { event_id: eventId! } })),
@@ -154,16 +185,21 @@ class SyncServiceClass {
         }>('/sync/areas-database', { params: { event_id: eventId! } })),
       ]);
 
-      await this.syncQrTrust(eventId);
-      await DatabaseService.upsertSyncedUsers(eventId, usersData.users);
-      await DatabaseService.upsertSyncedAreas(eventId, areasData.areas);
-      await DatabaseService.setQrAuthorityPublicKey(eventId, areasData.qr_authority_public_key);
+      const trustGeneration = await this.syncQrTrust(eventId);
+      await DatabaseService.promoteAuthorizationSnapshot({
+        eventId,
+        trustGeneration,
+        users: usersData.users,
+        areas: areasData.areas,
+        legacyAuthorityPublicKey: areasData.qr_authority_public_key,
+      });
 
       if (event.ends_at) {
         await DatabaseService.purgeIfEventExpired(new Date(event.ends_at).getTime());
       }
 
-      const uploadedScans = await this.uploadQueuedScans();
+      await this.drainTransitionAuditQueues();
+      const uploadedScans = await this.uploadQueuedScans(eventId);
       const incidentUpload = await this.uploadQueuedIncidents();
       if (!incidentUpload.success) {
         return {
@@ -200,6 +236,7 @@ class SyncServiceClass {
       }
       await ApiClient.request('/notifications/sync-heartbeat', {
         method: 'POST',
+        timeoutMs: 5_000,
         body: { device_id: deviceId, app: 'scan', event_id: eventId, platform: Platform.OS },
       }).catch(() => undefined);
 
@@ -227,7 +264,7 @@ class SyncServiceClass {
     }
   }
 
-  private async syncQrTrust(eventId: number): Promise<void> {
+  private async syncQrTrust(eventId: number): Promise<number> {
     let cursor: string | undefined;
     let snapshotGeneration: number | null = null;
     for (let pageNumber = 0; pageNumber < 100; pageNumber += 1) {
@@ -243,8 +280,7 @@ class SyncServiceClass {
       }
       await DatabaseService.stageQrTrustPage(page, pageNumber === 0);
       if (!page.has_more) {
-        await DatabaseService.promoteQrTrustSnapshot(eventId, snapshotGeneration);
-        return;
+        return snapshotGeneration;
       }
       if (!page.next_cursor || page.next_cursor === cursor) {
         throw new Error('QR trust pagination did not advance');
@@ -268,8 +304,45 @@ class SyncServiceClass {
     return { uploaded };
   }
 
+  private async drainTransitionAuditQueues(): Promise<void> {
+    const credentials = await ApiClient.getTransitionAuditCredentials();
+    for (const credential of credentials) {
+      if (Date.now() >= Date.parse(credential.expires_at)) {
+        await DatabaseService.quarantineEventScanLogs(
+          credential.event_id,
+          'The authorized event-transition audit upload window expired'
+        );
+        await ApiClient.removeTransitionAuditCredential(credential.event_id);
+        continue;
+      }
+      try {
+        await this.drainDeregisteredAuditQueues({
+          eventId: credential.event_id,
+          cutoff: credential.cutoff,
+          deadline: credential.expires_at,
+          accessToken: credential.auditToken,
+        });
+      } catch (error) {
+        if (
+          error instanceof ApiError &&
+          (error.code === 'DEVICE_BLACKLISTED' || error.code === 'DEVICE_DEREGISTERED')
+        ) {
+          await DatabaseService.quarantineEventScanLogs(
+            credential.event_id,
+            `Transition audit authority is unavailable: ${error.message}`
+          );
+          await ApiClient.removeTransitionAuditCredential(credential.event_id);
+        }
+      }
+    }
+  }
+
   private async uploadEligibleAuditScans(session: DeregisteredAuditSession): Promise<number> {
-    const records = await DatabaseService.getEligibleAuditScanLogs(session.cutoff, SCAN_UPLOAD_BATCH_SIZE);
+    const records = await DatabaseService.getEligibleAuditScanLogs(
+      session.eventId,
+      session.cutoff,
+      SCAN_UPLOAD_BATCH_SIZE
+    );
     if (records.length === 0) return 0;
     const groups = new Map<number, typeof records>();
     records.forEach((record) => {
@@ -311,22 +384,27 @@ class SyncServiceClass {
           },
         }
       );
-      const acknowledged = new Set(
-        response.results
-          .filter((item) => item.status === 'accepted' || item.status === 'duplicate')
-          .map((item) => item.client_record_id)
-      );
-      const ids = group
-        .filter((record) => record.device_scan_id && acknowledged.has(record.device_scan_id))
-        .map((record) => record.id);
-      await DatabaseService.markScanLogsSynced(ids);
-      uploaded += ids.length;
+      const byId = new Map(response.results.map((result) => [result.client_record_id, result]));
+      const outcomes = group.map((record) => {
+        const result = record.device_scan_id ? byId.get(record.device_scan_id) : undefined;
+        return {
+          id: record.id,
+          status: result?.status ?? 'retryable_error' as const,
+          error: result?.error ?? (result ? undefined : 'Malformed acknowledgement'),
+          serverId: result?.server_id,
+        };
+      });
+      await DatabaseService.recordScanUploadOutcomes(outcomes);
+      uploaded += outcomes.filter(
+        (outcome) => outcome.status === 'accepted' || outcome.status === 'duplicate'
+      ).length;
     }
     return uploaded;
   }
 
   private async uploadEligibleAuditIncidents(session: DeregisteredAuditSession): Promise<number> {
     const records = await DatabaseService.getEligibleAuditIncidents(
+      session.eventId,
       session.cutoff,
       AUXILIARY_UPLOAD_BATCH_SIZE
     );
@@ -358,6 +436,7 @@ class SyncServiceClass {
 
   private async uploadEligibleAuditOverrides(session: DeregisteredAuditSession): Promise<number> {
     const records = await DatabaseService.getEligibleAuditOverrides(
+      session.eventId,
       session.cutoff,
       AUXILIARY_UPLOAD_BATCH_SIZE
     );
@@ -392,25 +471,18 @@ class SyncServiceClass {
     return uploaded;
   }
 
-  private async uploadQueuedScans(): Promise<number> {
+  private async uploadQueuedScans(eventId: number): Promise<number> {
     let totalUploaded = 0;
     const deviceId = await this.getDeviceId();
     const maximumBatches = SCAN_UPLOAD_MAX_BATCHES_PER_SYNC ?? 1;
 
     for (let batchNumber = 0; batchNumber < maximumBatches; batchNumber += 1) {
-      const pending = await DatabaseService.getUnsyncedScanLogs(SCAN_UPLOAD_BATCH_SIZE);
+      const pending = await DatabaseService.getUnsyncedScanLogs(SCAN_UPLOAD_BATCH_SIZE, eventId);
       if (pending.length === 0) break;
-
-      const groups = new Map<number, typeof pending>();
-      pending.forEach((record) => {
-        const group = groups.get(record.event_id) ?? [];
-        group.push(record);
-        groups.set(record.event_id, group);
-      });
 
       let uploadedThisBatch = 0;
       let receivedRetryableFailure = false;
-      for (const [eventId, records] of groups) {
+      for (const records of [pending]) {
         const logs = records.map((log) => ({
           client_record_id: log.device_scan_id,
           event_id: log.event_id,
@@ -431,23 +503,38 @@ class SyncServiceClass {
           },
         }));
 
-        const response = await withBackoff(() =>
-          ApiClient.request<QueueAckResponse>('/sync/scan-logs', {
-            method: 'POST',
-            body: { logs, device_id: deviceId, event_id: eventId },
-          })
-        );
-        const acknowledged = new Set(
-          response.results
-            .filter((item) => item.status === 'accepted' || item.status === 'duplicate')
-            .map((item) => item.client_record_id)
-        );
-        receivedRetryableFailure ||= response.results.some((item) => item.status === 'retryable_error');
-        const ids = records
-          .filter((item) => item.device_scan_id && acknowledged.has(item.device_scan_id))
-          .map((item) => item.id);
-        await DatabaseService.markScanLogsSynced(ids);
-        uploadedThisBatch += ids.length;
+        try {
+          const response = await withBackoff(() =>
+            ApiClient.request<QueueAckResponse>('/sync/scan-logs', {
+              method: 'POST',
+              timeoutMs: 20_000,
+              idempotencyKey: `scan:${eventId}:${records.map((record) => record.device_scan_id).join(',')}`,
+              body: { logs, device_id: deviceId, event_id: eventId },
+            })
+          );
+          const byId = new Map(response.results.map((result) => [result.client_record_id, result]));
+          const outcomes = records.map((record) => {
+            const result = record.device_scan_id ? byId.get(record.device_scan_id) : undefined;
+            return {
+              id: record.id,
+              status: result?.status ?? 'retryable_error' as const,
+              error: result?.error ?? (result ? undefined : 'Malformed acknowledgement'),
+              serverId: result?.server_id,
+            };
+          });
+          receivedRetryableFailure ||= outcomes.some((outcome) => outcome.status === 'retryable_error');
+          await DatabaseService.recordScanUploadOutcomes(outcomes);
+          uploadedThisBatch += outcomes.filter(
+            (outcome) => outcome.status === 'accepted' || outcome.status === 'duplicate'
+          ).length;
+        } catch (error) {
+          await DatabaseService.recordScanUploadOutcomes(records.map((record) => ({
+            id: record.id,
+            status: 'retryable_error' as const,
+            error: this.queueError(error),
+          })));
+          receivedRetryableFailure = true;
+        }
       }
 
       totalUploaded += uploadedThisBatch;

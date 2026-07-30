@@ -10,6 +10,7 @@ jest.mock('../ApiClient', () => ({
   ApiClient: {
     isAuthenticated: jest.fn(() => true),
     hasDeviceSession: jest.fn(() => true),
+    getDeviceEventId: jest.fn(() => 4),
     getDeviceState: jest.fn(),
     obtainAuditCredential: jest.fn(),
     clearTokens: jest.fn(async () => undefined),
@@ -69,6 +70,7 @@ describe('Scan connected device enforcement', () => {
     expect(result).toEqual({ status: 'revoked', reason: 'deregistered' });
     expect(SyncScheduler.stop).toHaveBeenCalled();
     expect(SyncService.drainDeregisteredAuditQueues).toHaveBeenCalledWith({
+      eventId: 4,
       cutoff: '2026-07-27T12:00:00.000Z',
       deadline: '2026-07-27T12:15:00.000Z',
       accessToken: 'audit-token',

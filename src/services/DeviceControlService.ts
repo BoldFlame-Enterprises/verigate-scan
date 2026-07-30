@@ -39,8 +39,11 @@ class DeviceControlServiceClass {
     await SecureStore.setItemAsync(DEVICE_CONTROL_STATE_KEY, reason);
     if (reason === 'deregistered') {
       try {
+        const eventId = ApiClient.getDeviceEventId();
+        if (!eventId) throw new Error('Deregistered device event binding is unavailable');
         const credential = await ApiClient.obtainAuditCredential();
         await SyncService.drainDeregisteredAuditQueues({
+          eventId,
           cutoff: credential.state_changed_at,
           deadline: credential.expires_at,
           accessToken: credential.accessToken,

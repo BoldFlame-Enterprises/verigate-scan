@@ -25,7 +25,15 @@ jest.mock('../ApiClient', () => ({
       this.responseData = mockResponseData;
     }
   },
-  ApiClient: { isAuthenticated: jest.fn(() => true), getTokenBinding: jest.fn(() => 'token-family-1'), request: jest.fn() },
+  ApiClient: {
+    isAuthenticated: jest.fn(() => true),
+    hasDeviceSession: jest.fn(() => true),
+    getDeviceEventId: jest.fn(() => 6),
+    getTokenBinding: jest.fn(() => 'token-family-1'),
+    getTransitionAuditCredentials: jest.fn(async () => []),
+    removeTransitionAuditCredential: jest.fn(async () => undefined),
+    request: jest.fn(),
+  },
 }));
 jest.mock('../OfflineSessionService', () => ({
   OfflineSessionService: { refreshProductionBinding: jest.fn(async () => undefined) },
@@ -37,14 +45,14 @@ jest.mock('../DatabaseService', () => ({
   DatabaseService: {
     upsertSyncedUsers: jest.fn(async () => undefined),
     upsertSyncedAreas: jest.fn(async () => undefined),
-    setQrAuthorityPublicKey: jest.fn(async () => undefined),
     stageQrTrustPage: jest.fn(async () => undefined),
-    promoteQrTrustSnapshot: jest.fn(async () => undefined),
+    promoteAuthorizationSnapshot: jest.fn(async () => undefined),
+    quarantineEventScanLogs: jest.fn(async () => undefined),
     purgeIfEventExpired: jest.fn(async () => false),
     getUnsyncedScanLogs: jest.fn(async () => []),
     getUnsyncedIncidents: jest.fn(async () => []),
     getUnsyncedOverrides: jest.fn(async () => []),
-    markScanLogsSynced: jest.fn(async () => undefined),
+    recordScanUploadOutcomes: jest.fn(async () => undefined),
     markIncidentsSynced: jest.fn(async () => undefined),
     markOverridesSynced: jest.fn(async () => undefined),
     recordIncidentFailure: jest.fn(async () => undefined),
@@ -77,6 +85,7 @@ describe('SyncService', () => {
     jest.mocked(DatabaseService.getUnsyncedScanLogs).mockResolvedValue([]);
     jest.mocked(DatabaseService.getUnsyncedIncidents).mockResolvedValue([]);
     jest.mocked(DatabaseService.getUnsyncedOverrides).mockResolvedValue([]);
+    jest.mocked(ApiClient.getTransitionAuditCredentials).mockResolvedValue([]);
   });
 
   it('stores the lossless user projection and trusted event QR authority', async () => {
@@ -92,9 +101,14 @@ describe('SyncService', () => {
 
     const result = await SyncService.syncNow();
     expect(result.success).toBe(true);
-    expect(DatabaseService.upsertSyncedUsers).toHaveBeenCalledWith(6, users);
-    expect(DatabaseService.setQrAuthorityPublicKey).toHaveBeenCalledWith(6, 'authority-key');
-    expect(DatabaseService.promoteQrTrustSnapshot).toHaveBeenCalledWith(6, 2);
+    expect(ApiClient.request).not.toHaveBeenCalledWith('/events');
+    expect(DatabaseService.promoteAuthorizationSnapshot).toHaveBeenCalledWith({
+      eventId: 6,
+      trustGeneration: 2,
+      users,
+      areas,
+      legacyAuthorityPublicKey: 'authority-key',
+    });
     expect(OfflineSessionService.refreshProductionBinding).toHaveBeenCalledWith({
       eventId: 6,
       deviceId: 'scan-installation',
@@ -163,8 +177,6 @@ describe('SyncService', () => {
       error: 'QR trust snapshot changed during pagination',
     });
     expect(DatabaseService.stageQrTrustPage).toHaveBeenCalledTimes(1);
-    expect(DatabaseService.promoteQrTrustSnapshot).not.toHaveBeenCalled();
-    expect(DatabaseService.upsertSyncedUsers).not.toHaveBeenCalled();
-    expect(DatabaseService.upsertSyncedAreas).not.toHaveBeenCalled();
+    expect(DatabaseService.promoteAuthorizationSnapshot).not.toHaveBeenCalled();
   });
 });

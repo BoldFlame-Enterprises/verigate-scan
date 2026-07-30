@@ -98,6 +98,10 @@ export default function LoginScreen() {
         }
         const previousEventId = await SyncService.getCurrentEventId();
         const selectedEvent = events.find((event) => event.id === previousEventId) ?? events[0];
+        await SyncService.selectEvent({
+          ...selectedEvent,
+          ends_at: (selectedEvent as { ends_at?: string | null }).ends_at ?? null,
+        });
         const installationId = await SyncService.getDeviceId();
         await ApiClient.registerDeviceSession(
           selectedEvent.id,

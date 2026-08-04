@@ -1,5 +1,9 @@
 /* eslint-disable import/first */
-jest.mock('expo-secure-store', () => ({ getItemAsync: jest.fn(async () => null), setItemAsync: jest.fn(async () => undefined) }));
+jest.mock('expo-secure-store', () => ({
+  getItemAsync: jest.fn(async () => null),
+  setItemAsync: jest.fn(async () => undefined),
+  deleteItemAsync: jest.fn(async () => undefined),
+}));
 jest.mock('expo-application', () => ({ getAndroidId: jest.fn(() => 'scan-device'), getIosIdForVendorAsync: jest.fn(async () => 'scan-device') }));
 jest.mock('expo-crypto', () => ({
   randomUUID: jest.fn(() => 'fallback-device'),
@@ -47,6 +51,7 @@ jest.mock('../DatabaseService', () => ({
     upsertSyncedAreas: jest.fn(async () => undefined),
     stageQrTrustPage: jest.fn(async () => undefined),
     promoteAuthorizationSnapshot: jest.fn(async () => undefined),
+    hasAuthorizationSnapshot: jest.fn(async () => false),
     quarantineEventScanLogs: jest.fn(async () => undefined),
     purgeIfEventExpired: jest.fn(async () => false),
     getUnsyncedScanLogs: jest.fn(async () => []),
@@ -80,6 +85,16 @@ const trustPage = {
   checksum: 'a'.repeat(64),
 };
 
+const authorizationManifest = {
+  contract_version: 'authorization-manifest-v1',
+  event_id: 6,
+  checksum: 'b'.repeat(64),
+  trust_generation: 2,
+  generated_at: '2026-07-29T00:00:00.000Z',
+  event: { name: 'Event 6', is_active: true, starts_at: null, ends_at: null },
+  counts: { users: 1, areas: 1 },
+};
+
 describe('SyncService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -91,13 +106,15 @@ describe('SyncService', () => {
     jest.mocked(DatabaseService.getUnsyncedScanLogs).mockResolvedValue([]);
     jest.mocked(DatabaseService.getUnsyncedIncidents).mockResolvedValue([]);
     jest.mocked(DatabaseService.getUnsyncedOverrides).mockResolvedValue([]);
+    jest.mocked(DatabaseService.hasAuthorizationSnapshot).mockResolvedValue(false);
     jest.mocked(ApiClient.getTransitionAuditCredentials).mockResolvedValue([]);
   });
 
   it('stores the lossless user projection and trusted event QR authority', async () => {
     const users = [{ id: 1, event_id: 6, email: 'user@example.com', name: 'User', phone: '1', is_active: true, assignments: [] }];
     const areas = [{ id: 3, name: 'Arena', requires_scan: true }];
-    jest.mocked(ApiClient.request).mockImplementation(async (path: string) => {
+    jest.mocked(ApiClient.request).mockImplementation(async (path: string, options = {}) => {
+      if (path === '/sync/areas-database' && options?.params?.view === 'manifest') return authorizationManifest as never;
       if (path === '/events') return [{ id: 6, name: 'Event', ends_at: null }] as never;
       if (path === '/sync/users-database') return { contract_version: 'event-user-v2', users } as never;
       if (path === '/sync/areas-database') return { areas, qr_authority_public_key: 'authority-key' } as never;
@@ -128,6 +145,38 @@ describe('SyncService', () => {
     });
   });
 
+  it('skips unchanged authorization downloads while still completing queue and heartbeat work', async () => {
+    jest.mocked(SecureStore.getItemAsync).mockImplementation(async (key) => {
+      if (key === 'verigate_scan_event_active') return 'true';
+      if (key === 'verigate_scan_event_name') return 'Event 6';
+      if (key === 'verigate_scan_authorization_manifest') {
+        return JSON.stringify({ eventId: 6, checksum: 'b'.repeat(64), users: 12, areas: 3 });
+      }
+      return null;
+    });
+    jest.mocked(DatabaseService.hasAuthorizationSnapshot).mockResolvedValue(true);
+    jest.mocked(ApiClient.request).mockImplementation(async (path: string, options = {}) => {
+      if (path === '/sync/areas-database' && options.params?.view === 'manifest') return {
+        ...authorizationManifest,
+        counts: { users: 12, areas: 3 },
+      } as never;
+      return {} as never;
+    });
+
+    await expect(SyncService.syncNow()).resolves.toMatchObject({
+      success: true,
+      userCount: 12,
+      areaCount: 3,
+    });
+    expect(ApiClient.request).not.toHaveBeenCalledWith('/sync/users-database', expect.anything());
+    expect(jest.mocked(ApiClient.request).mock.calls.filter(
+      ([path, options]) => path === '/sync/areas-database' && options?.params?.view !== 'manifest'
+    )).toHaveLength(0);
+    expect(ApiClient.request).not.toHaveBeenCalledWith('/sync/qr-trust', expect.anything());
+    expect(DatabaseService.promoteAuthorizationSnapshot).not.toHaveBeenCalled();
+    expect(ApiClient.request).toHaveBeenCalledWith('/notifications/sync-heartbeat', expect.anything());
+  });
+
   it('propagates an auxiliary queue retry as an unsuccessful overall sync', async () => {
     const users = [{ id: 1, event_id: 6, email: 'user@example.com', name: 'User', phone: '1', is_active: true, assignments: [] }];
     const areas = [{ id: 3, name: 'Arena', requires_scan: true }];
@@ -145,7 +194,8 @@ describe('SyncService', () => {
       last_error: null,
       terminal_failure: false,
     }]);
-    jest.mocked(ApiClient.request).mockImplementation(async (path: string) => {
+    jest.mocked(ApiClient.request).mockImplementation(async (path: string, options = {}) => {
+      if (path === '/sync/areas-database' && options.params?.view === 'manifest') return authorizationManifest as never;
       if (path === '/events') return [{ id: 6, name: 'Event', ends_at: null }] as never;
       if (path === '/sync/users-database') return { contract_version: 'event-user-v2', users } as never;
       if (path === '/sync/areas-database') return { areas, qr_authority_public_key: 'authority-key' } as never;
@@ -166,7 +216,8 @@ describe('SyncService', () => {
     const users = [{ id: 1, event_id: 6, email: 'user@example.com', name: 'User', phone: '1', is_active: true, assignments: [] }];
     const areas = [{ id: 3, name: 'Arena', requires_scan: true }];
     let trustRequest = 0;
-    jest.mocked(ApiClient.request).mockImplementation(async (path: string) => {
+    jest.mocked(ApiClient.request).mockImplementation(async (path: string, options = {}) => {
+      if (path === '/sync/areas-database' && options.params?.view === 'manifest') return authorizationManifest as never;
       if (path === '/events') return [{ id: 6, name: 'Event', ends_at: null }] as never;
       if (path === '/sync/users-database') return { contract_version: 'event-user-v2', users } as never;
       if (path === '/sync/areas-database') return { areas, qr_authority_public_key: 'authority-key' } as never;
@@ -189,6 +240,29 @@ describe('SyncService', () => {
       error: 'QR trust snapshot changed during pagination',
     });
     expect(DatabaseService.stageQrTrustPage).toHaveBeenCalledTimes(1);
+    expect(DatabaseService.promoteAuthorizationSnapshot).not.toHaveBeenCalled();
+  });
+
+  it('does not promote downloads when the manifest changes during synchronization', async () => {
+    let manifestRequest = 0;
+    jest.mocked(ApiClient.request).mockImplementation(async (path: string, options = {}) => {
+      if (path === '/sync/areas-database' && options.params?.view === 'manifest') {
+        manifestRequest += 1;
+        return {
+          ...authorizationManifest,
+          checksum: (manifestRequest === 1 ? 'b' : 'c').repeat(64),
+        } as never;
+      }
+      if (path === '/sync/users-database') return { contract_version: 'event-user-v2', users: [] } as never;
+      if (path === '/sync/areas-database') return { areas: [], qr_authority_public_key: 'authority-key' } as never;
+      if (path === '/sync/qr-trust') return trustPage as never;
+      return {} as never;
+    });
+
+    await expect(SyncService.syncNow()).resolves.toMatchObject({
+      success: false,
+      error: 'Authorization snapshot changed during synchronization',
+    });
     expect(DatabaseService.promoteAuthorizationSnapshot).not.toHaveBeenCalled();
   });
 });

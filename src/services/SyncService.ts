@@ -18,6 +18,7 @@ const CURRENT_EVENT_STARTS_AT_KEY = 'verigate_scan_event_starts_at';
 const CURRENT_EVENT_ENDS_AT_KEY = 'verigate_scan_event_ends_at';
 const CURRENT_EVENT_ACTIVE_KEY = 'verigate_scan_event_active';
 const LAST_SYNC_AT_KEY = 'verigate_scan_last_sync_at';
+const AUTHORIZATION_MANIFEST_KEY = 'verigate_scan_authorization_manifest';
 
 export interface RemoteEvent {
   id: number;
@@ -65,6 +66,55 @@ interface AuxiliaryUploadResult {
   success: boolean;
   uploaded: number;
   error?: string;
+}
+
+interface AuthorizationManifest {
+  contract_version: 'authorization-manifest-v1';
+  event_id: number;
+  checksum: string;
+  trust_generation: number;
+  generated_at: string;
+  event: Omit<RemoteEvent, 'id'>;
+  counts: { users: number; areas: number };
+}
+
+interface StoredAuthorizationManifest {
+  eventId: number;
+  checksum: string;
+  users: number;
+  areas: number;
+}
+
+function validateAuthorizationManifest(manifest: AuthorizationManifest, eventId: number): void {
+  if (
+    manifest.contract_version !== 'authorization-manifest-v1' ||
+    manifest.event_id !== eventId ||
+    !/^[a-f0-9]{64}$/.test(manifest.checksum) ||
+    !Number.isSafeInteger(manifest.trust_generation) || manifest.trust_generation < 0 ||
+    !Number.isSafeInteger(manifest.counts.users) || manifest.counts.users < 0 ||
+    !Number.isSafeInteger(manifest.counts.areas) || manifest.counts.areas < 0 ||
+    typeof manifest.event?.name !== 'string' ||
+    typeof manifest.event?.is_active !== 'boolean'
+  ) {
+    throw new Error('Authorization manifest is invalid');
+  }
+}
+
+async function storedAuthorizationManifest(): Promise<StoredAuthorizationManifest | null> {
+  const serialized = await SecureStore.getItemAsync(AUTHORIZATION_MANIFEST_KEY);
+  if (!serialized) return null;
+  try {
+    const value = JSON.parse(serialized) as StoredAuthorizationManifest;
+    if (
+      !Number.isSafeInteger(value.eventId) ||
+      !/^[a-f0-9]{64}$/.test(value.checksum) ||
+      !Number.isSafeInteger(value.users) ||
+      !Number.isSafeInteger(value.areas)
+    ) return null;
+    return value;
+  } catch {
+    return null;
+  }
 }
 
 /** Retries only bounded dependency failures; session and validation failures are terminal. */
@@ -171,6 +221,7 @@ class SyncServiceClass {
       SecureStore.deleteItemAsync(CURRENT_EVENT_ENDS_AT_KEY),
       SecureStore.deleteItemAsync(CURRENT_EVENT_ACTIVE_KEY),
       SecureStore.deleteItemAsync(LAST_SYNC_AT_KEY),
+      SecureStore.deleteItemAsync(AUTHORIZATION_MANIFEST_KEY),
     ]);
   }
 
@@ -190,36 +241,53 @@ class SyncServiceClass {
       if (!eventId) {
         return { success: false, error: 'Device session has no validated event binding' };
       }
-      const event: RemoteEvent = {
-        id: eventId,
-        name: await this.getCurrentEventName() ?? `Event ${eventId}`,
-        starts_at: await SecureStore.getItemAsync(CURRENT_EVENT_STARTS_AT_KEY),
-        ends_at: await SecureStore.getItemAsync(CURRENT_EVENT_ENDS_AT_KEY),
-        is_active: (await SecureStore.getItemAsync(CURRENT_EVENT_ACTIVE_KEY)) === 'true',
-      };
+      const manifest = await withBackoff(() => ApiClient.request<AuthorizationManifest>(
+        '/sync/areas-database',
+        { params: { event_id: eventId, view: 'manifest' } }
+      ));
+      validateAuthorizationManifest(manifest, eventId);
+      const event: RemoteEvent = { id: eventId, ...manifest.event };
+      await this.selectEvent(event);
 
-      const [usersData, areasData] = await Promise.all([
-        withBackoff(() => ApiClient.request<{ contract_version: string; users: User[] }>('/sync/users-database', { params: { event_id: eventId! } })),
-        withBackoff(() => ApiClient.request<{
-          areas: { id: number; name: string; requires_scan: boolean }[];
-          qr_authority_public_key: string;
-        }>('/sync/areas-database', { params: { event_id: eventId! } })),
+      const [storedManifest, hasSnapshot] = await Promise.all([
+        storedAuthorizationManifest(),
+        DatabaseService.hasAuthorizationSnapshot(eventId),
       ]);
-
-      const trustGeneration = await this.syncQrTrust(eventId);
-      await DatabaseService.promoteAuthorizationSnapshot({
-        eventId,
-        event: {
-          name: event.name,
-          is_active: event.is_active,
-          starts_at: event.starts_at,
-          ends_at: event.ends_at,
-        },
-        trustGeneration,
-        users: usersData.users,
-        areas: areasData.areas,
-        legacyAuthorityPublicKey: areasData.qr_authority_public_key,
-      });
+      const unchanged = hasSnapshot &&
+        storedManifest?.eventId === eventId &&
+        storedManifest.checksum === manifest.checksum;
+      if (!unchanged) {
+        const [usersData, areasData] = await Promise.all([
+          withBackoff(() => ApiClient.request<{ contract_version: string; users: User[] }>('/sync/users-database', { params: { event_id: eventId } })),
+          withBackoff(() => ApiClient.request<{
+            areas: { id: number; name: string; requires_scan: boolean }[];
+            qr_authority_public_key: string;
+          }>('/sync/areas-database', { params: { event_id: eventId } })),
+        ]);
+        const trustGeneration = await this.syncQrTrust(eventId);
+        const confirmedManifest = await withBackoff(() => ApiClient.request<AuthorizationManifest>(
+          '/sync/areas-database',
+          { params: { event_id: eventId, view: 'manifest' } }
+        ));
+        validateAuthorizationManifest(confirmedManifest, eventId);
+        if (confirmedManifest.checksum !== manifest.checksum) {
+          throw new Error('Authorization snapshot changed during synchronization');
+        }
+        await DatabaseService.promoteAuthorizationSnapshot({
+          eventId,
+          event: manifest.event,
+          trustGeneration,
+          users: usersData.users,
+          areas: areasData.areas,
+          legacyAuthorityPublicKey: areasData.qr_authority_public_key,
+        });
+        await SecureStore.setItemAsync(AUTHORIZATION_MANIFEST_KEY, JSON.stringify({
+          eventId,
+          checksum: manifest.checksum,
+          users: manifest.counts.users,
+          areas: manifest.counts.areas,
+        } satisfies StoredAuthorizationManifest));
+      }
 
       await this.drainTransitionAuditQueues();
       const uploadedScans = await this.uploadQueuedScans(eventId);
@@ -229,8 +297,8 @@ class SyncServiceClass {
           success: false,
           eventId,
           eventName: event.name,
-          userCount: usersData.users.length,
-          areaCount: areasData.areas.length,
+          userCount: manifest.counts.users,
+          areaCount: manifest.counts.areas,
           uploadedScans,
           error: incidentUpload.error ?? 'Incident queue upload did not complete safely',
         };
@@ -241,8 +309,8 @@ class SyncServiceClass {
           success: false,
           eventId,
           eventName: event.name,
-          userCount: usersData.users.length,
-          areaCount: areasData.areas.length,
+          userCount: manifest.counts.users,
+          areaCount: manifest.counts.areas,
           uploadedScans,
           error: overrideUpload.error ?? 'Override queue upload did not complete safely',
         };
@@ -267,8 +335,8 @@ class SyncServiceClass {
         success: true,
         eventId,
         eventName: event.name,
-        userCount: usersData.users.length,
-        areaCount: areasData.areas.length,
+        userCount: manifest.counts.users,
+        areaCount: manifest.counts.areas,
         uploadedScans,
       };
     } catch (error) {

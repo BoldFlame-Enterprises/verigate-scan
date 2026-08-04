@@ -1178,6 +1178,17 @@ class DatabaseServiceClass {
     } : null;
   }
 
+  async hasAuthorizationSnapshot(eventId: number): Promise<boolean> {
+    if (!this.database) throw new Error('Database not initialized');
+    const row = await this.database.getFirstAsync(
+      `SELECT
+         EXISTS(SELECT 1 FROM event_authority WHERE event_id = ?) AS has_event,
+         EXISTS(SELECT 1 FROM qr_trust_metadata WHERE event_id = ?) AS has_trust`,
+      [eventId, eventId]
+    ) as { has_event?: number | boolean; has_trust?: number | boolean } | null;
+    return Boolean(row?.has_event) && Boolean(row?.has_trust);
+  }
+
   async getQueueHealth(eventId: number): Promise<QueueHealth> {
     if (!this.database) throw new Error('Database not initialized');
     const scan = await this.database.getFirstAsync(

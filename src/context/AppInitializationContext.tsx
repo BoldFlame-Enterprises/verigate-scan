@@ -8,9 +8,11 @@ import React, {
   useReducer,
   useRef,
 } from 'react';
+import { AppState } from 'react-native';
 import { ApiClient } from '@/services/ApiClient';
 import { DatabaseService } from '@/services/DatabaseService';
 import { DeregistrationAuditService } from '@/services/DeregistrationAuditService';
+import { StorageMaintenanceService } from '@/services/StorageMaintenanceService';
 
 const MAX_INITIALIZATION_ATTEMPTS = 3;
 
@@ -85,6 +87,7 @@ export function AppInitializationProvider({ children }: { children: ReactNode })
         maximumPasses: 4,
         foregroundBudgetMs: 1_500,
       }).catch(() => undefined);
+      void StorageMaintenanceService.run().catch(() => undefined);
       dispatch({ type: 'success' });
     }).catch((error: unknown) => {
       dispatch({
@@ -103,6 +106,20 @@ export function AppInitializationProvider({ children }: { children: ReactNode })
     started.current = true;
     void initialize();
   }, [initialize]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'active') {
+        void DatabaseService.markRuntimeActive().catch(() => undefined);
+      } else {
+        void DatabaseService.markCleanShutdown().catch(() => undefined);
+      }
+    });
+    return () => {
+      subscription.remove();
+      void DatabaseService.markCleanShutdown().catch(() => undefined);
+    };
+  }, []);
 
   const value = useMemo(() => ({ ...state, retry: initialize }), [initialize, state]);
   return (

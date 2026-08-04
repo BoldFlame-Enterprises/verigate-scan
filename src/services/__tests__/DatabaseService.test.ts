@@ -32,6 +32,7 @@ type DatabaseDouble = {
 type TestableDatabaseService = {
   database: DatabaseDouble | null;
   createTables(): Promise<void>;
+  verifyNativeIntegrity(): Promise<unknown>;
 };
 
 const service = DatabaseService as unknown as TestableDatabaseService;
@@ -158,6 +159,58 @@ describe('DatabaseService event-scoped users', () => {
       unresolved: 16,
     });
     expect(database.getFirstAsync.mock.calls.every(([, params]) => params?.[0] === 7)).toBe(true);
+  });
+
+  it('uses native integrity results and does not treat an unsupported cipher check as corruption', async () => {
+    const database = createDatabaseDouble();
+    database.getAllAsync.mockImplementation(async (sql) => {
+      if (sql === 'PRAGMA quick_check') return [{ quick_check: 'ok' }];
+      if (sql === 'PRAGMA cipher_version') return [];
+      return [];
+    });
+    service.database = database;
+
+    await expect(service.verifyNativeIntegrity()).resolves.toEqual({
+      quickCheck: 'ok',
+      cipherCheck: 'unsupported',
+    });
+    expect(database.execAsync).not.toHaveBeenCalledWith(expect.stringContaining('DELETE FROM'));
+  });
+
+  it('fails closed on a native quick-check error without deleting local tables', async () => {
+    const database = createDatabaseDouble();
+    database.getAllAsync.mockResolvedValueOnce([{ quick_check: 'database disk image is malformed' }]);
+    service.database = database;
+
+    await expect(service.verifyNativeIntegrity()).rejects.toThrow(/integrity check failed/i);
+    expect(database.execAsync).not.toHaveBeenCalledWith(expect.stringContaining('DELETE FROM'));
+  });
+
+  it('builds bounded retention commands that preserve unresolved records and the active event', async () => {
+    const database = createDatabaseDouble();
+    service.database = database;
+    await DatabaseService.performStorageMaintenance({
+      activeEventId: 7,
+      now: Date.parse('2026-08-04T12:00:00.000Z'),
+    });
+
+    const commands = database.executeBatchAsync.mock.calls[0][0];
+    expect(commands.every(([sql]) => compact(sql).includes('LIMIT 500'))).toBe(true);
+    expect(commands.map(([sql]) => compact(sql)).join(' ')).toContain("upload_state = 'acknowledged'");
+    expect(commands.map(([sql]) => compact(sql)).join(' ')).not.toContain("upload_state IN ('pending', 'retryable')");
+    expect(commands.some(([, params]) => params?.includes(7))).toBe(true);
+  });
+
+  it('scopes displayed scan history to the selected event', async () => {
+    const database = createDatabaseDouble();
+    service.database = database;
+
+    await DatabaseService.getScanLogs(7, 10);
+
+    expect(database.getAllAsync).toHaveBeenCalledWith(
+      expect.stringContaining('WHERE event_id = ?'),
+      [7, 10]
+    );
   });
 
   it('does not record a successful checksum when an atomic snapshot replacement fails', async () => {
@@ -445,10 +498,10 @@ describe('DatabaseService event-scoped users', () => {
       'DELETE FROM qr_trust_stage_revocations WHERE event_id = ?',
     ]));
     expect(commands.every(([, params]) => !params || !params.includes(22))).toBe(true);
-    expect(SecureStore.setItemAsync).toHaveBeenCalled();
+    expect(SecureStore.setItemAsync).not.toHaveBeenCalled();
   });
 
-  it('retains the old authorization snapshot and checksum when combined promotion fails', async () => {
+  it('retains the old authorization snapshot when combined promotion fails', async () => {
     const database = createDatabaseDouble();
     database.getFirstAsync.mockResolvedValueOnce({ generation: 8 });
     database.executeBatchAsync.mockRejectedValueOnce(new Error('injected promotion failure'));

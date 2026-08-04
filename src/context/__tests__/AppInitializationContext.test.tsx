@@ -3,10 +3,17 @@ jest.mock('@/services/ApiClient', () => ({
   ApiClient: { loadTokens: jest.fn() },
 }));
 jest.mock('@/services/DatabaseService', () => ({
-  DatabaseService: { initDatabase: jest.fn() },
+  DatabaseService: {
+    initDatabase: jest.fn(),
+    markRuntimeActive: jest.fn(),
+    markCleanShutdown: jest.fn(),
+  },
 }));
 jest.mock('@/services/DeregistrationAuditService', () => ({
   DeregistrationAuditService: { resume: jest.fn() },
+}));
+jest.mock('@/services/StorageMaintenanceService', () => ({
+  StorageMaintenanceService: { run: jest.fn() },
 }));
 
 import {

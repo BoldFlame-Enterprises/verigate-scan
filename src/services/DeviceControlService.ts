@@ -22,6 +22,8 @@ export type DeviceStateCheck =
   | { status: 'offline' }
   | { status: 'revoked'; reason: DeviceControlReason };
 
+export type StoredDeviceControlState = DeviceControlReason | 'unknown';
+
 class DeviceControlServiceClass {
   private listeners = new Set<(reason: DeviceControlReason) => void | Promise<void>>();
 
@@ -32,6 +34,11 @@ class DeviceControlServiceClass {
 
   async clearRevocationMarker(): Promise<void> {
     await SecureStore.deleteItemAsync(DEVICE_CONTROL_STATE_KEY);
+  }
+
+  async getStoredControlState(): Promise<StoredDeviceControlState> {
+    const stored = await SecureStore.getItemAsync(DEVICE_CONTROL_STATE_KEY);
+    return stored === 'deregistered' || stored === 'blacklisted' ? stored : 'unknown';
   }
 
   async revoke(reason: DeviceControlReason): Promise<void> {

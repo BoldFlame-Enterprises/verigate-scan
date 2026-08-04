@@ -123,6 +123,13 @@ export default function QueueStatusScreen() {
       <Pressable accessibilityRole="button" style={styles.secondary} onPress={() => router.back()}>
         <Text style={styles.secondaryText}>Back</Text>
       </Pressable>
+      <Pressable
+        accessibilityRole="button"
+        style={styles.secondary}
+        onPress={() => router.push('/(main)/storage-recovery')}
+      >
+        <Text style={styles.secondaryText}>Storage integrity and recovery</Text>
+      </Pressable>
       <Text style={styles.privacy}>
         Diagnostics omit QR payloads, tokens, secrets, attendee email, and other unnecessary personal data.
       </Text>

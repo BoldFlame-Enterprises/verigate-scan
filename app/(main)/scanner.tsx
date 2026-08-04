@@ -433,7 +433,12 @@ export default function ScannerScreen() {
 
   const viewScanLogs = async () => {
     try {
-      const logs = await DatabaseService.getScanLogs(10);
+      const eventId = await SyncService.getCurrentEventId();
+      if (!eventId) {
+        Alert.alert('Event required', 'Select an event before viewing scan history.');
+        return;
+      }
+      const logs = await DatabaseService.getScanLogs(eventId, 10);
       const logText = logs.map(log =>
         `${log.user_name} - ${log.area} - ${log.access_granted ? 'GRANTED' : 'DENIED'} - ${new Date(log.scanned_at).toLocaleTimeString()}`
       ).join('\n');

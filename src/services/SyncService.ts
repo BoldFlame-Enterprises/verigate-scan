@@ -221,10 +221,6 @@ class SyncServiceClass {
         legacyAuthorityPublicKey: areasData.qr_authority_public_key,
       });
 
-      if (event.ends_at) {
-        await DatabaseService.purgeIfEventExpired(new Date(event.ends_at).getTime());
-      }
-
       await this.drainTransitionAuditQueues();
       const uploadedScans = await this.uploadQueuedScans(eventId);
       const incidentUpload = await this.uploadQueuedIncidents();

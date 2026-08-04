@@ -25,6 +25,10 @@ export default function MainLayout() {
         name="queue-status"
         options={{ title: 'Audit Queue Health' }}
       />
+      <Stack.Screen
+        name="storage-recovery"
+        options={{ title: 'Storage Recovery' }}
+      />
     </Stack>
   );
 }

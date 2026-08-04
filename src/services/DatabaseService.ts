@@ -153,103 +153,62 @@ export interface QrTrustPage {
 
 const MAX_QUEUE_ERROR_LENGTH = 500;
 const DEVICE_CONTROL_STATE_KEY = 'verigate_scan_device_control_state';
+const DATABASE_RUNTIME_STATE_KEY = 'verigate_scan_database_runtime_state';
+const RETENTION_BATCH_SIZE = 500;
+const ACKNOWLEDGED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const EVENT_AUDIT_GRACE_MS = 24 * 60 * 60 * 1000;
+
+export interface NativeIntegrityResult {
+  quickCheck: 'ok';
+  cipherCheck: 'ok' | 'unsupported';
+}
 
 class DatabaseServiceClass {
   private database: SQLite.SQLiteDatabase | null = null;
 
   async initDatabase(): Promise<void> {
     try {
-      this.database = await this.openWithIntegrityCheck();
+      this.database = await SQLite.openDatabaseAsync('verigate_scan.db');
+      await this.database.execAsync('SELECT 1');
+      await this.verifyNativeIntegrity();
       await this.createTables();
-      await this.verifyIntegrityAndRecoverIfTampered();
       if (DEMO_MODE) {
         await this.createAndStoreEncryptedSeedData();
       }
-      await this.recordIntegrityChecksum();
+      await this.markRuntimeActive();
     } catch (error) {
       console.error('Database initialization error:', error);
       throw error;
     }
   }
 
-  /** Opens the encrypted database. If it fails to open or fails a cheap
-   * sanity query, the file is genuinely deleted and recreated from scratch
-   * with a fresh device key during secure-storage recovery, not just reopened
-   * against the same broken file. */
-  private async openWithIntegrityCheck(): Promise<SQLite.SQLiteDatabase> {
-    try {
-      const db = await SQLite.openDatabaseAsync('verigate_scan.db');
-      await db.execAsync('SELECT 1');
-      return db;
-    } catch (error) {
-      console.warn('Encrypted database failed to open (corrupted?) - deleting and recreating:', error);
-      await SQLite.resetDatabase('verigate_scan.db');
-      await SecureStore.deleteItemAsync('db_integrity_checksum');
-      await SecureStore.deleteItemAsync('scanner_seed_data_created');
-      return SQLite.openDatabaseAsync('verigate_scan.db');
+  async verifyNativeIntegrity(): Promise<NativeIntegrityResult> {
+    if (!this.database) throw new Error('Database not initialized');
+    const quickRows = await this.database.getAllAsync<Record<string, unknown>>('PRAGMA quick_check');
+    const quickValues = quickRows.flatMap((row) => Object.values(row)).map(String);
+    if (quickValues.length === 0 || quickValues.some((value) => value.toLowerCase() !== 'ok')) {
+      throw new Error(`Database integrity check failed: ${quickValues.join('; ') || 'no result'}`);
     }
-  }
 
-  /** Compares current data against the last-recorded checksum *before* this
-   * launch does any seeding/sync writes. A mismatch on a database that
-   * already had data and a prior checksum means the file was modified
-   * outside the app - reset rather than silently trust altered data. */
-  private async verifyIntegrityAndRecoverIfTampered(): Promise<void> {
-    try {
-      const previous = await SecureStore.getItemAsync('db_integrity_checksum');
-      if (!previous) return; // first run, nothing to compare against yet
-
-      const current = await this.computeIntegrityChecksum();
-      if (current === previous) return;
-
-      const existingScanners = await this.getDemoScannerUsers();
-      const existingUsers = await this.getDemoRegularUsers();
-      if (existingScanners.length === 0 && existingUsers.length === 0) return; // nothing to have been tampered with
-
-      console.warn('Local database integrity check failed (unexpected external change) - resetting to a clean state');
-      await this.database?.execAsync('DELETE FROM users; DELETE FROM scanner_users; DELETE FROM synced_areas;');
-      await SecureStore.deleteItemAsync('scanner_seed_data_created');
-      await SecureStore.deleteItemAsync('db_integrity_checksum');
-    } catch (error) {
-      console.warn('Integrity verification failed to run:', error);
+    const cipherVersion = await this.database.getAllAsync<Record<string, unknown>>('PRAGMA cipher_version');
+    if (cipherVersion.length === 0) {
+      return { quickCheck: 'ok', cipherCheck: 'unsupported' };
     }
-  }
-
-  private async computeIntegrityChecksum(): Promise<string> {
-    const scanners = await this.getDemoScannerUsers();
-    const users = await this.getDemoRegularUsers();
-    const canonical = JSON.stringify({
-      scanners: scanners.map((s) => ({ ...s })).sort((a, b) => a.id - b.id),
-      users: users.map((u) => ({ ...u })).sort((a, b) =>
-        (a.event_id ?? 0) - (b.event_id ?? 0) || a.id - b.id
-      ),
-    });
-    return Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, canonical);
-  }
-
-  private async recordIntegrityChecksum(): Promise<void> {
-    try {
-      const checksum = await this.computeIntegrityChecksum();
-      await SecureStore.setItemAsync('db_integrity_checksum', checksum);
-    } catch (error) {
-      console.warn('Could not record integrity checksum:', error);
+    const cipherRows = await this.database.getAllAsync<Record<string, unknown>>('PRAGMA cipher_integrity_check');
+    const cipherValues = cipherRows.flatMap((row) => Object.values(row)).map(String);
+    if (cipherValues.some((value) => value.toLowerCase() !== 'ok')) {
+      throw new Error(`Database cipher integrity check failed: ${cipherValues.join('; ')}`);
     }
+    return { quickCheck: 'ok', cipherCheck: 'ok' };
   }
 
-  /** Wipes synced event data once the event has ended (plus a grace period). */
-  async purgeIfEventExpired(eventEndsAtMs: number | null, gracePeriodMs = 24 * 60 * 60 * 1000): Promise<boolean> {
-    if (!eventEndsAtMs || Date.now() < eventEndsAtMs + gracePeriodMs) return false;
-    if (!this.database) return false;
+  async markRuntimeActive(): Promise<void> {
+    await SecureStore.setItemAsync(DATABASE_RUNTIME_STATE_KEY, 'active');
+  }
 
-    await this.database.execAsync(`
-      DELETE FROM users;
-      DELETE FROM synced_areas;
-      DELETE FROM qr_authority_keys;
-      DELETE FROM qr_revocations;
-      DELETE FROM qr_trust_metadata;
-    `);
-    await this.recordIntegrityChecksum();
-    return true;
+  async markCleanShutdown(): Promise<void> {
+    await SecureStore.setItemAsync(DATABASE_RUNTIME_STATE_KEY, 'clean');
   }
 
   private async createTables(): Promise<void> {
@@ -352,7 +311,8 @@ class DatabaseServiceClass {
         attempt_count INTEGER NOT NULL DEFAULT 0,
         last_attempt_at TEXT,
         last_error TEXT,
-        terminal_failure INTEGER NOT NULL DEFAULT 0
+        terminal_failure INTEGER NOT NULL DEFAULT 0,
+        acknowledged_at TEXT
       );
     `);
 
@@ -372,7 +332,8 @@ class DatabaseServiceClass {
         attempt_count INTEGER NOT NULL DEFAULT 0,
         last_attempt_at TEXT,
         last_error TEXT,
-        terminal_failure INTEGER NOT NULL DEFAULT 0
+        terminal_failure INTEGER NOT NULL DEFAULT 0,
+        acknowledged_at TEXT
       );
     `);
 
@@ -477,6 +438,7 @@ class DatabaseServiceClass {
     await this.addColumnIfMissing('incidents_queue', 'terminal_failure', 'INTEGER NOT NULL DEFAULT 0');
     await this.addColumnIfMissing('incidents_queue', 'quarantined', 'INTEGER NOT NULL DEFAULT 0');
     await this.addColumnIfMissing('incidents_queue', 'quarantine_reason', 'TEXT');
+    await this.addColumnIfMissing('incidents_queue', 'acknowledged_at', 'TEXT');
     await this.addColumnIfMissing('overrides_queue', 'client_record_id', 'TEXT');
     await this.addColumnIfMissing('overrides_queue', 'occurred_at', 'TEXT');
     await this.addColumnIfMissing('overrides_queue', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
@@ -485,6 +447,7 @@ class DatabaseServiceClass {
     await this.addColumnIfMissing('overrides_queue', 'terminal_failure', 'INTEGER NOT NULL DEFAULT 0');
     await this.addColumnIfMissing('overrides_queue', 'quarantined', 'INTEGER NOT NULL DEFAULT 0');
     await this.addColumnIfMissing('overrides_queue', 'quarantine_reason', 'TEXT');
+    await this.addColumnIfMissing('overrides_queue', 'acknowledged_at', 'TEXT');
     const unresolvedLegacyIdentities = await this.database.getFirstAsync(
       `SELECT
          (SELECT COUNT(*) FROM incidents_queue
@@ -1016,9 +979,6 @@ class DatabaseServiceClass {
     }
     await this.database.executeBatchAsync(commands);
 
-    // Sync is a legitimate data change - re-baseline the integrity checksum
-    // so the next launch doesn't mistake this update for external tampering.
-    await this.recordIntegrityChecksum();
   }
 
   async promoteAuthorizationSnapshot(input: {
@@ -1139,7 +1099,6 @@ class DatabaseServiceClass {
       ['DELETE FROM qr_trust_stage_revocations WHERE event_id = ?', [input.eventId]],
     );
     await this.database.executeBatchAsync(commands);
-    await this.recordIntegrityChecksum();
   }
 
   /**
@@ -1169,7 +1128,6 @@ class DatabaseServiceClass {
       [scanner.id, scanner.email, scanner.name, scanner.role, JSON.stringify(allowedAreas)]
     );
 
-    await this.recordIntegrityChecksum();
   }
 
   async upsertSyncedAreas(eventId: number, areas: { id: number; name: string; requires_scan: boolean }[]): Promise<void> {
@@ -1252,6 +1210,18 @@ class DatabaseServiceClass {
       ...combined,
       unresolved: combined.pending + combined.retrying + combined.terminal + combined.quarantined,
     };
+  }
+
+  async getTotalUnresolvedRecordCount(): Promise<number> {
+    if (!this.database) throw new Error('Database not initialized');
+    const row = await this.database.getFirstAsync(
+      `SELECT
+         (SELECT COUNT(*) FROM scan_logs
+          WHERE synced = 0 AND upload_state != 'acknowledged') +
+         (SELECT COUNT(*) FROM incidents_queue WHERE synced = 0) +
+         (SELECT COUNT(*) FROM overrides_queue WHERE synced = 0) AS unresolved`
+    ) as { unresolved?: number } | null;
+    return Number(row?.unresolved ?? 0);
   }
 
   private async auxiliaryQueueHealth(
@@ -1548,9 +1518,9 @@ class DatabaseServiceClass {
     await this.database.runAsync(
       `UPDATE incidents_queue
        SET synced = 1, last_error = NULL, terminal_failure = 0,
-           quarantined = 0, quarantine_reason = NULL
+           quarantined = 0, quarantine_reason = NULL, acknowledged_at = ?
        WHERE id IN (${placeholders})`,
-      ids
+      [new Date().toISOString(), ...ids]
     );
   }
 
@@ -1612,9 +1582,9 @@ class DatabaseServiceClass {
     await this.database.runAsync(
       `UPDATE overrides_queue
        SET synced = 1, last_error = NULL, terminal_failure = 0,
-           quarantined = 0, quarantine_reason = NULL
+           quarantined = 0, quarantine_reason = NULL, acknowledged_at = ?
        WHERE id IN (${placeholders})`,
-      ids
+      [new Date().toISOString(), ...ids]
     );
   }
 
@@ -1641,14 +1611,112 @@ class DatabaseServiceClass {
     );
   }
 
-  async getScanLogs(limit: number = 50): Promise<ScanLog[]> {
+  async performStorageMaintenance(input: { activeEventId: number | null; now: number }): Promise<void> {
+    if (!this.database) throw new Error('Database not initialized');
+    const acknowledgedCutoff = new Date(input.now - ACKNOWLEDGED_RETENTION_MS).toISOString();
+    const terminalCutoff = new Date(input.now - TERMINAL_RETENTION_MS).toISOString();
+    const eventCutoff = new Date(input.now - EVENT_AUDIT_GRACE_MS).toISOString();
+    const activeEventId = input.activeEventId ?? -1;
+    const commands: Parameters<SQLite.SQLiteDatabase['executeBatchAsync']>[0] = [
+      [
+        `DELETE FROM scan_logs WHERE id IN (
+           SELECT id FROM scan_logs
+           WHERE upload_state = 'acknowledged' AND acknowledged_at < ?
+           ORDER BY id LIMIT ${RETENTION_BATCH_SIZE}
+         )`,
+        [acknowledgedCutoff],
+      ],
+      [
+        `DELETE FROM scan_logs WHERE id IN (
+           SELECT id FROM scan_logs
+           WHERE upload_state IN ('terminal', 'quarantined') AND scanned_at < ?
+           ORDER BY id LIMIT ${RETENTION_BATCH_SIZE}
+         )`,
+        [terminalCutoff],
+      ],
+      [
+        `DELETE FROM incidents_queue WHERE id IN (
+           SELECT id FROM incidents_queue
+           WHERE synced = 1 AND acknowledged_at < ?
+           ORDER BY id LIMIT ${RETENTION_BATCH_SIZE}
+         )`,
+        [acknowledgedCutoff],
+      ],
+      [
+        `DELETE FROM incidents_queue WHERE id IN (
+           SELECT id FROM incidents_queue
+           WHERE synced = 0 AND (terminal_failure = 1 OR quarantined = 1) AND occurred_at < ?
+           ORDER BY id LIMIT ${RETENTION_BATCH_SIZE}
+         )`,
+        [terminalCutoff],
+      ],
+      [
+        `DELETE FROM overrides_queue WHERE id IN (
+           SELECT id FROM overrides_queue
+           WHERE synced = 1 AND acknowledged_at < ?
+           ORDER BY id LIMIT ${RETENTION_BATCH_SIZE}
+         )`,
+        [acknowledgedCutoff],
+      ],
+      [
+        `DELETE FROM overrides_queue WHERE id IN (
+           SELECT id FROM overrides_queue
+           WHERE synced = 0 AND (terminal_failure = 1 OR quarantined = 1) AND occurred_at < ?
+           ORDER BY id LIMIT ${RETENTION_BATCH_SIZE}
+         )`,
+        [terminalCutoff],
+      ],
+    ];
+
+    const eventTables = [
+      'users',
+      'synced_areas',
+      'sync_metadata',
+      'qr_authority_keys',
+      'qr_revocations',
+      'qr_trust_metadata',
+      'qr_trust_stage_keys',
+      'qr_trust_stage_revocations',
+      'qr_trust_stage_metadata',
+      'event_authority',
+    ] as const;
+    for (const table of eventTables) {
+      commands.push([
+        `DELETE FROM ${table} WHERE rowid IN (
+           SELECT target.rowid FROM ${table} target
+           JOIN event_authority authority ON authority.event_id = target.event_id
+           WHERE target.event_id != ? AND authority.ends_at IS NOT NULL AND authority.ends_at < ?
+             AND NOT EXISTS (
+               SELECT 1 FROM scan_logs queue
+               WHERE queue.event_id = target.event_id
+                 AND queue.upload_state IN ('pending', 'processing', 'retryable')
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM incidents_queue queue
+               WHERE queue.event_id = target.event_id AND queue.synced = 0
+                 AND queue.terminal_failure = 0 AND queue.quarantined = 0
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM overrides_queue queue
+               WHERE queue.event_id = target.event_id AND queue.synced = 0
+                 AND queue.terminal_failure = 0 AND queue.quarantined = 0
+             )
+           LIMIT ${RETENTION_BATCH_SIZE}
+         )`,
+        [activeEventId, eventCutoff],
+      ]);
+    }
+    await this.database.executeBatchAsync(commands);
+  }
+
+  async getScanLogs(eventId: number, limit: number = 50): Promise<ScanLog[]> {
     if (!this.database) {
       throw new Error('Database not initialized');
     }
 
     const result = await this.database.getAllAsync(
-      'SELECT * FROM scan_logs ORDER BY scanned_at DESC LIMIT ?',
-      [limit]
+      'SELECT * FROM scan_logs WHERE event_id = ? ORDER BY scanned_at DESC LIMIT ?',
+      [eventId, limit]
     ) as any[];
 
     return result.map(row => ({
@@ -2013,6 +2081,7 @@ class DatabaseServiceClass {
     await SQLite.resetDatabase('verigate_scan.db');
     await Promise.all([
       SecureStore.deleteItemAsync('db_integrity_checksum'),
+      SecureStore.deleteItemAsync(DATABASE_RUNTIME_STATE_KEY),
       SecureStore.deleteItemAsync('scanner_seed_data_created'),
       SecureStore.deleteItemAsync('scanner_remembered_email'),
       SecureStore.deleteItemAsync('scanner_last_login'),

@@ -38,9 +38,9 @@ async function getOrCreateDeviceKey(dbName: string): Promise<string> {
 
 /**
  * Deletes the encrypted database file on disk and its stored key, so the
- * next `openDatabaseAsync` call starts completely fresh with a new
- * device key. Used as the real rollback path when the database fails to
- * open or fails an integrity check (corruption/tampering).
+ * next `openDatabaseAsync` call starts completely fresh with a new device
+ * key. This destructive primitive is used only by the policy-gated scanner
+ * reprovisioning flow; integrity failures never invoke it automatically.
  */
 export async function resetDatabase(dbName: string): Promise<void> {
   try {

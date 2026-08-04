@@ -906,7 +906,8 @@ class DatabaseServiceClass {
            credential_id, nonce_hash, decision_code, decision_source,
            manual_reason, identity_evidence_confirmed, trust_generation,
            user_snapshot_at, scanner_installation_id, synced)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+       ON CONFLICT(device_scan_id) DO NOTHING`,
       [
         scanLog.event_id,
         scanLog.user_id,
@@ -1490,15 +1491,22 @@ class DatabaseServiceClass {
     await this.quarantineEventQueues(eventId, reason);
   }
 
-  async queueIncident(eventId: number, category: string, description: string, area?: string, areaId?: number): Promise<void> {
+  async queueIncident(
+    eventId: number,
+    category: string,
+    description: string,
+    area?: string,
+    areaId?: number,
+    clientRecordId: string = Crypto.randomUUID(),
+    occurredAt: string = new Date().toISOString()
+  ): Promise<void> {
     if (!this.database) throw new Error('Database not initialized');
     await this.assertRecordingAuthority();
-    const clientRecordId = Crypto.randomUUID();
-    const occurredAt = new Date().toISOString();
     await this.database.runAsync(
       `INSERT INTO incidents_queue
          (client_record_id, event_id, area, area_id, category, description, occurred_at, created_at, synced)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+       ON CONFLICT(client_record_id) DO NOTHING`,
       [clientRecordId, eventId, area ?? null, areaId ?? null, category, description, occurredAt, occurredAt]
     );
   }
@@ -1545,16 +1553,17 @@ class DatabaseServiceClass {
     accessGranted: boolean,
     reason: string,
     userEmail?: string,
-    areaId?: number
+    areaId?: number,
+    clientRecordId: string = Crypto.randomUUID(),
+    occurredAt: string = new Date().toISOString()
   ): Promise<void> {
     if (!this.database) throw new Error('Database not initialized');
     await this.assertRecordingAuthority();
-    const clientRecordId = Crypto.randomUUID();
-    const occurredAt = new Date().toISOString();
     await this.database.runAsync(
       `INSERT INTO overrides_queue
          (client_record_id, event_id, user_email, area, area_id, access_granted, reason, occurred_at, created_at, synced)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+       ON CONFLICT(client_record_id) DO NOTHING`,
       [clientRecordId, eventId, userEmail ?? null, area, areaId ?? null, accessGranted ? 1 : 0, reason, occurredAt, occurredAt]
     );
   }

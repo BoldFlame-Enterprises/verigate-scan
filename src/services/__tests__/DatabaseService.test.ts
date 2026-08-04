@@ -370,6 +370,19 @@ describe('DatabaseService event-scoped users', () => {
 
     expect(database.runAsync.mock.calls[0][1]?.[0]).toBe('new-incident-uuid');
     expect(database.runAsync.mock.calls[1][1]?.[0]).toBe('new-override-uuid');
+    expect(compact(database.runAsync.mock.calls[0][0])).toContain('ON CONFLICT(client_record_id) DO NOTHING');
+    expect(compact(database.runAsync.mock.calls[1][0])).toContain('ON CONFLICT(client_record_id) DO NOTHING');
+  });
+
+  it('uses caller-stable record IDs for safe operational retries', async () => {
+    const database = createDatabaseDouble();
+    service.database = database;
+
+    await DatabaseService.queueIncident(4, 'security', 'New incident', undefined, undefined, 'incident-stable');
+    await DatabaseService.queueOverride(4, 'Arena', true, 'New override', undefined, undefined, 'override-stable');
+
+    expect(database.runAsync.mock.calls[0][1]?.[0]).toBe('incident-stable');
+    expect(database.runAsync.mock.calls[1][1]?.[0]).toBe('override-stable');
   });
 
   it('reads bounded non-terminal queue rows and stores bounded failure metadata', async () => {

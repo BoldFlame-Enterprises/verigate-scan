@@ -11,6 +11,7 @@ import {
   Modal,
   TextInput,
   Switch,
+  Linking,
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Crypto from 'expo-crypto';
@@ -33,10 +34,63 @@ import {
   recordingFreshness,
 } from '../../src/services/RecordingAuthorityService';
 import { DEMO_MODE } from '../../src/config';
+import {
+  normalizeOperationalEmail,
+  normalizeOperationalText,
+  operationalFailureMessage,
+  OperationalFormStatus,
+  OPERATIONAL_FIELD_LIMITS,
+  OperationalSubmissionError,
+  StableOperationalSubmission,
+} from '../../src/components/OperationalForm';
 
 const { width } = Dimensions.get('window');
 
 type Modal_ = 'none' | 'manual' | 'override' | 'incident' | 'area';
+
+export function cameraPermissionRecovery(canAskAgain: boolean): 'request' | 'settings' {
+  return canAskAgain ? 'request' : 'settings';
+}
+
+export function CameraPermissionPanel({
+  canAskAgain,
+  onRequest,
+  onSettings,
+  onQueue,
+}: {
+  canAskAgain: boolean;
+  onRequest: () => void;
+  onSettings: () => void;
+  onQueue: () => void;
+}) {
+  const recovery = cameraPermissionRecovery(canAskAgain);
+  return (
+    <View style={styles.permissionContainer}>
+      <Text style={styles.permissionTitle} accessibilityRole="header">Camera Permission Required</Text>
+      <Text style={styles.permissionText}>
+        VeriGate Scan needs camera access to scan QR codes for access control.
+      </Text>
+      <TouchableOpacity
+        accessibilityRole="button"
+        accessibilityLabel={recovery === 'request' ? 'Grant camera permission' : 'Open device settings for camera permission'}
+        style={styles.permissionButton}
+        onPress={recovery === 'request' ? onRequest : onSettings}
+      >
+        <Text style={styles.permissionButtonText}>
+          {recovery === 'request' ? 'Grant Permission' : 'Open Device Settings'}
+        </Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        accessibilityRole="button"
+        accessibilityLabel="Open audit queue recovery"
+        style={styles.permissionButton}
+        onPress={onQueue}
+      >
+        <Text style={styles.permissionButtonText}>Open Audit Queue</Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
 
 export default function ScannerScreen() {
   const {
@@ -460,15 +514,12 @@ export default function ScannerScreen() {
 
   if (!permission.granted) {
     return (
-      <View style={styles.permissionContainer}>
-        <Text style={styles.permissionTitle}>Camera Permission Required</Text>
-        <Text style={styles.permissionText}>
-          VeriGate Scan needs camera access to scan QR codes for access control.
-        </Text>
-        <TouchableOpacity style={styles.permissionButton} onPress={requestPermission}>
-          <Text style={styles.permissionButtonText}>Grant Permission</Text>
-        </TouchableOpacity>
-      </View>
+      <CameraPermissionPanel
+        canAskAgain={permission.canAskAgain}
+        onRequest={() => void requestPermission()}
+        onSettings={() => void Linking.openSettings()}
+        onQueue={() => router.push('/(main)/queue-status')}
+      />
     );
   }
 
@@ -678,7 +729,7 @@ function AreaPickerModal({
               <Text style={modalStyles.optionText}>{area}</Text>
             </TouchableOpacity>
           ))}
-          <TouchableOpacity style={modalStyles.cancelButton} onPress={onClose}>
+          <TouchableOpacity accessibilityRole="button" style={modalStyles.cancelButton} onPress={onClose}>
             <Text style={modalStyles.cancelText}>Cancel</Text>
           </TouchableOpacity>
         </View>
@@ -687,7 +738,7 @@ function AreaPickerModal({
   );
 }
 
-function ManualEntryModal({
+export function ManualEntryModal({
   visible,
   area,
   scannerName,
@@ -710,16 +761,22 @@ function ManualEntryModal({
   const [reason, setReason] = useState('');
   const [identityEvidenceConfirmed, setIdentityEvidenceConfirmed] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submissionStatus, setSubmissionStatus] = useState('');
+  const submission = useRef(new StableOperationalSubmission());
 
   const handleSubmit = async () => {
     if (isSubmitting) return;
-    if (!email.trim()) {
-      Alert.alert('Error', 'Enter the attendee email printed on their badge/ID.');
-      return;
-    }
-
-    if (reason.trim().length < 3) {
-      Alert.alert('Reason required', 'Record why cryptographic QR verification cannot be used.');
+    let normalizedEmail: string;
+    let normalizedReason: string;
+    try {
+      normalizedEmail = normalizeOperationalEmail(email) as string;
+      normalizedReason = normalizeOperationalText(reason, {
+        label: 'Reason', min: 3, max: OPERATIONAL_FIELD_LIMITS.reason,
+      }) as string;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Manual entry is invalid';
+      setSubmissionStatus(message);
+      Alert.alert('Manual entry invalid', message);
       return;
     }
     if (!identityEvidenceConfirmed) {
@@ -740,9 +797,10 @@ function ManualEntryModal({
       return;
     }
     setIsSubmitting(true);
+    setSubmissionStatus('Recording manual decision…');
     try {
       const recordedAt = new Date();
-      const user = await DatabaseService.getUserByEmail(email.toLowerCase().trim(), eventId);
+      const user = await DatabaseService.getUserByEmail(normalizedEmail, eventId);
       const decision = user
         ? evaluateManualAssignment(user, eventId, authorityInput.selectedArea.id, recordedAt.getTime())
         : {
@@ -750,24 +808,33 @@ function ManualEntryModal({
             code: 'manual_subject_missing',
             reason: 'No matching active attendee exists in the current event snapshot.',
           };
-      const deviceScanId = Crypto.randomUUID();
-      await DatabaseService.logScan({
-        event_id: eventId,
-        user_id: user?.id ?? null,
-        user_name: user?.name ?? null,
-        area,
-        area_id: authorityInput.selectedArea.id,
-        access_granted: decision.granted,
-        failure_reason: decision.granted ? undefined : decision.reason,
-        scanned_at: recordedAt.toISOString(),
-        scanner_user: `${scannerName} (manual)`,
-        device_scan_id: deviceScanId,
-        decision_code: decision.code,
-        decision_source: 'manual',
-        manual_reason: reason.trim(),
-        identity_evidence_confirmed: true,
-        user_snapshot_at: lastSyncAt ? new Date(lastSyncAt).toISOString() : null,
-        scanner_installation_id: await SyncService.getDeviceId(),
+      const installationId = await SyncService.getDeviceId();
+      await submission.current.submit(async (operationId) => {
+        try {
+          await DatabaseService.logScan({
+            event_id: eventId,
+            user_id: user?.id ?? null,
+            user_name: user?.name ?? null,
+            area,
+            area_id: authorityInput.selectedArea!.id,
+            access_granted: decision.granted,
+            failure_reason: decision.granted ? undefined : decision.reason,
+            scanned_at: recordedAt.toISOString(),
+            scanner_user: `${scannerName} (manual)`,
+            device_scan_id: operationId,
+            decision_code: decision.code,
+            decision_source: 'manual',
+            manual_reason: normalizedReason,
+            identity_evidence_confirmed: true,
+            user_snapshot_at: lastSyncAt ? new Date(lastSyncAt).toISOString() : null,
+            scanner_installation_id: installationId,
+          });
+        } catch (error) {
+          throw new OperationalSubmissionError(
+            'local-persistence',
+            error instanceof Error ? error.message : 'Local database write failed'
+          );
+        }
       });
 
       onResult({
@@ -781,10 +848,13 @@ function ManualEntryModal({
       setEmail('');
       setReason('');
       setIdentityEvidenceConfirmed(false);
+      setSubmissionStatus('Manual decision recorded.');
     } catch (error) {
+      const message = operationalFailureMessage(error);
+      setSubmissionStatus(message);
       onResult({
         success: false,
-        message: error instanceof Error ? error.message : 'Manual decision could not be recorded',
+        message,
         timestamp: new Date(),
       });
     } finally {
@@ -793,35 +863,59 @@ function ManualEntryModal({
   };
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={isSubmitting ? () => undefined : onClose}>
       <View style={modalStyles.backdrop}>
         <View style={modalStyles.sheet}>
           <Text style={modalStyles.title}>Manual entry (damaged QR fallback)</Text>
           <Text style={modalStyles.helperText}>Area: {area || 'none selected'}</Text>
           <TextInput
+            accessibilityLabel="Attendee email for manual entry"
             style={modalStyles.input}
             placeholder="Attendee email"
             placeholderTextColor="#6b7280"
             autoCapitalize="none"
             keyboardType="email-address"
             value={email}
-            onChangeText={setEmail}
+            editable={!isSubmitting}
+            maxLength={OPERATIONAL_FIELD_LIMITS.email}
+            onChangeText={(value) => { submission.current.abandon(); setEmail(value); }}
           />
           <TextInput
+            accessibilityLabel="Reason QR verification cannot be used"
             style={modalStyles.input}
             placeholder="Reason QR verification cannot be used"
             placeholderTextColor="#6b7280"
             value={reason}
-            onChangeText={setReason}
+            editable={!isSubmitting}
+            maxLength={OPERATIONAL_FIELD_LIMITS.reason}
+            onChangeText={(value) => { submission.current.abandon(); setReason(value); }}
           />
           <View style={modalStyles.switchRow}>
             <Text style={modalStyles.optionText}>Approved identity evidence checked</Text>
-            <Switch value={identityEvidenceConfirmed} onValueChange={setIdentityEvidenceConfirmed} />
+            <Switch
+              accessibilityLabel="Approved identity evidence checked"
+              disabled={isSubmitting}
+              value={identityEvidenceConfirmed}
+              onValueChange={(value) => { submission.current.abandon(); setIdentityEvidenceConfirmed(value); }}
+            />
           </View>
-          <TouchableOpacity style={modalStyles.submitButton} onPress={handleSubmit} disabled={isSubmitting}>
+          <OperationalFormStatus message={submissionStatus} busy={isSubmitting} />
+          <TouchableOpacity
+            accessibilityRole="button"
+            accessibilityState={{ disabled: isSubmitting, busy: isSubmitting }}
+            style={modalStyles.submitButton}
+            onPress={handleSubmit}
+            disabled={isSubmitting}
+          >
             <Text style={modalStyles.submitText}>{isSubmitting ? 'Recording...' : 'Verify and record'}</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={modalStyles.cancelButton} onPress={onClose}>
+          <TouchableOpacity
+            accessibilityRole="button"
+            accessibilityState={{ disabled: isSubmitting }}
+            disabled={isSubmitting}
+            style={modalStyles.cancelButton}
+            onPress={onClose}
+          >
             <Text style={modalStyles.cancelText}>Cancel</Text>
           </TouchableOpacity>
         </View>
@@ -830,7 +924,7 @@ function ManualEntryModal({
   );
 }
 
-function OverrideModal({
+export function OverrideModal({
   visible,
   area,
   eventId,
@@ -846,10 +940,24 @@ function OverrideModal({
   const [email, setEmail] = useState('');
   const [reason, setReason] = useState('');
   const [accessGranted, setAccessGranted] = useState(true);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submissionStatus, setSubmissionStatus] = useState('');
+  const submission = useRef(new StableOperationalSubmission());
+  const occurredAt = useRef<string | null>(null);
 
   const handleSubmit = async () => {
-    if (reason.trim().length < 3) {
-      Alert.alert('Reason required', 'A mandatory reason (at least a few words) must be logged for every emergency override.');
+    if (isSubmitting) return;
+    let normalizedReason: string;
+    let normalizedEmail: string | null;
+    try {
+      normalizedReason = normalizeOperationalText(reason, {
+        label: 'Reason', min: 3, max: OPERATIONAL_FIELD_LIMITS.reason,
+      }) as string;
+      normalizedEmail = normalizeOperationalEmail(email, true);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Override is invalid';
+      setSubmissionStatus(message);
+      Alert.alert('Override invalid', message);
       return;
     }
     const authority = evaluateRecordingAuthority({
@@ -866,49 +974,100 @@ function OverrideModal({
       return;
     }
 
-    const areas = await DatabaseService.getSyncedAreas(eventId);
-    const resolvedAreaId = areas.find((a) => a.name === area)?.id;
-
-    await DatabaseService.queueOverride(eventId, area, accessGranted, reason.trim(), email.trim() || undefined, resolvedAreaId);
-
-    Alert.alert('Override recorded', 'This will be uploaded and reviewed by an admin on the next sync.');
-    setEmail('');
-    setReason('');
-    setAccessGranted(true);
-    onClose();
+    setIsSubmitting(true);
+    setSubmissionStatus('Recording override…');
+    occurredAt.current ??= new Date().toISOString();
+    try {
+      await submission.current.submit(async (operationId) => {
+        try {
+          const areas = await DatabaseService.getSyncedAreas(eventId);
+          const resolvedAreaId = areas.find((item) => item.name === area)?.id;
+          await DatabaseService.queueOverride(
+            eventId,
+            area,
+            accessGranted,
+            normalizedReason,
+            normalizedEmail ?? undefined,
+            resolvedAreaId,
+            operationId,
+            occurredAt.current!
+          );
+        } catch (error) {
+          throw new OperationalSubmissionError(
+            'local-persistence',
+            error instanceof Error ? error.message : 'Local database write failed'
+          );
+        }
+      });
+      Alert.alert('Override recorded', 'This will be uploaded and reviewed by an admin on the next sync.');
+      setSubmissionStatus('Override recorded.');
+      setEmail('');
+      setReason('');
+      setAccessGranted(true);
+      occurredAt.current = null;
+      onClose();
+    } catch (error) {
+      setSubmissionStatus(operationalFailureMessage(error));
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={isSubmitting ? () => undefined : onClose}>
       <View style={modalStyles.backdrop}>
         <View style={modalStyles.sheet}>
           <Text style={modalStyles.title}>Emergency / manual override</Text>
           <Text style={modalStyles.helperText}>Area: {area || 'none selected'}</Text>
           <TextInput
+            accessibilityLabel="Optional attendee email for override"
             style={modalStyles.input}
             placeholder="Attendee email (optional)"
             placeholderTextColor="#6b7280"
             autoCapitalize="none"
             keyboardType="email-address"
             value={email}
-            onChangeText={setEmail}
+            editable={!isSubmitting}
+            maxLength={OPERATIONAL_FIELD_LIMITS.email}
+            onChangeText={(value) => { submission.current.abandon(); occurredAt.current = null; setEmail(value); }}
           />
           <View style={modalStyles.switchRow}>
             <Text style={modalStyles.optionText}>Grant access</Text>
-            <Switch value={accessGranted} onValueChange={setAccessGranted} />
+            <Switch
+              accessibilityLabel="Grant access in emergency override"
+              disabled={isSubmitting}
+              value={accessGranted}
+              onValueChange={(value) => { submission.current.abandon(); occurredAt.current = null; setAccessGranted(value); }}
+            />
           </View>
           <TextInput
+            accessibilityLabel="Mandatory emergency override reason"
             style={[modalStyles.input, modalStyles.multiline]}
             placeholder="Reason (mandatory)"
             placeholderTextColor="#6b7280"
             value={reason}
-            onChangeText={setReason}
+            editable={!isSubmitting}
+            maxLength={OPERATIONAL_FIELD_LIMITS.reason}
+            onChangeText={(value) => { submission.current.abandon(); occurredAt.current = null; setReason(value); }}
             multiline
           />
-          <TouchableOpacity style={modalStyles.submitButton} onPress={handleSubmit}>
-            <Text style={modalStyles.submitText}>Record override</Text>
+          <OperationalFormStatus message={submissionStatus} busy={isSubmitting} />
+          <TouchableOpacity
+            accessibilityRole="button"
+            accessibilityState={{ disabled: isSubmitting, busy: isSubmitting }}
+            disabled={isSubmitting}
+            style={modalStyles.submitButton}
+            onPress={handleSubmit}
+          >
+            <Text style={modalStyles.submitText}>{isSubmitting ? 'Recording…' : 'Record override'}</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={modalStyles.cancelButton} onPress={onClose}>
+          <TouchableOpacity
+            accessibilityRole="button"
+            accessibilityState={{ disabled: isSubmitting }}
+            disabled={isSubmitting}
+            style={modalStyles.cancelButton}
+            onPress={onClose}
+          >
             <Text style={modalStyles.cancelText}>Cancel</Text>
           </TouchableOpacity>
         </View>
@@ -917,7 +1076,7 @@ function OverrideModal({
   );
 }
 
-function IncidentModal({
+export function IncidentModal({
   visible,
   area,
   eventId,
@@ -932,10 +1091,22 @@ function IncidentModal({
 }) {
   const [category, setCategory] = useState('suspicious_activity');
   const [description, setDescription] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submissionStatus, setSubmissionStatus] = useState('');
+  const submission = useRef(new StableOperationalSubmission());
+  const occurredAt = useRef<string | null>(null);
 
   const handleSubmit = async () => {
-    if (description.trim().length < 5) {
-      Alert.alert('Description required', 'Please describe the incident in a bit more detail.');
+    if (isSubmitting) return;
+    let normalizedDescription: string;
+    try {
+      normalizedDescription = normalizeOperationalText(description, {
+        label: 'Description', min: 5, max: OPERATIONAL_FIELD_LIMITS.description,
+      }) as string;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Incident description is invalid';
+      setSubmissionStatus(message);
+      Alert.alert('Description invalid', message);
       return;
     }
     const authority = evaluateRecordingAuthority({
@@ -952,43 +1123,98 @@ function IncidentModal({
       return;
     }
 
-    const areas = await DatabaseService.getSyncedAreas(eventId);
-    const resolvedAreaId = area ? areas.find((a) => a.name === area)?.id : undefined;
-
-    await DatabaseService.queueIncident(eventId, category, description.trim(), area, resolvedAreaId);
-    Alert.alert('Incident reported', 'This will be uploaded and visible to admins on the next sync.');
-    setDescription('');
-    onClose();
+    setIsSubmitting(true);
+    setSubmissionStatus('Recording incident…');
+    occurredAt.current ??= new Date().toISOString();
+    try {
+      await submission.current.submit(async (operationId) => {
+        try {
+          const areas = await DatabaseService.getSyncedAreas(eventId);
+          const resolvedAreaId = area ? areas.find((item) => item.name === area)?.id : undefined;
+          await DatabaseService.queueIncident(
+            eventId,
+            category,
+            normalizedDescription,
+            area,
+            resolvedAreaId,
+            operationId,
+            occurredAt.current!
+          );
+        } catch (error) {
+          throw new OperationalSubmissionError(
+            'local-persistence',
+            error instanceof Error ? error.message : 'Local database write failed'
+          );
+        }
+      });
+      Alert.alert('Incident reported', 'This will be uploaded and visible to admins on the next sync.');
+      setSubmissionStatus('Incident recorded.');
+      setDescription('');
+      occurredAt.current = null;
+      onClose();
+    } catch (error) {
+      setSubmissionStatus(operationalFailureMessage(error));
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={isSubmitting ? () => undefined : onClose}>
       <View style={modalStyles.backdrop}>
         <View style={modalStyles.sheet}>
           <Text style={modalStyles.title}>Report an incident</Text>
           <View style={modalStyles.categoryRow}>
             {['suspicious_activity', 'technical_issue', 'other'].map((c) => (
               <TouchableOpacity
+                accessibilityRole="radio"
+                accessibilityLabel={`${c} incident category`}
+                accessibilityState={{ checked: category === c, disabled: isSubmitting }}
+                disabled={isSubmitting}
                 key={c}
                 style={[modalStyles.categoryChip, category === c && modalStyles.categoryChipActive]}
-                onPress={() => setCategory(c)}
+                onPress={() => {
+                  submission.current.abandon();
+                  occurredAt.current = null;
+                  setCategory(c);
+                }}
               >
                 <Text style={modalStyles.categoryChipText}>{c.replace('_', ' ')}</Text>
               </TouchableOpacity>
             ))}
           </View>
           <TextInput
+            accessibilityLabel="Incident description"
             style={[modalStyles.input, modalStyles.multiline]}
             placeholder="What happened?"
             placeholderTextColor="#6b7280"
             value={description}
-            onChangeText={setDescription}
+            editable={!isSubmitting}
+            maxLength={OPERATIONAL_FIELD_LIMITS.description}
+            onChangeText={(value) => {
+              submission.current.abandon();
+              occurredAt.current = null;
+              setDescription(value);
+            }}
             multiline
           />
-          <TouchableOpacity style={modalStyles.submitButton} onPress={handleSubmit}>
-            <Text style={modalStyles.submitText}>Submit report</Text>
+          <OperationalFormStatus message={submissionStatus} busy={isSubmitting} />
+          <TouchableOpacity
+            accessibilityRole="button"
+            accessibilityState={{ disabled: isSubmitting, busy: isSubmitting }}
+            disabled={isSubmitting}
+            style={modalStyles.submitButton}
+            onPress={handleSubmit}
+          >
+            <Text style={modalStyles.submitText}>{isSubmitting ? 'Recording…' : 'Submit report'}</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={modalStyles.cancelButton} onPress={onClose}>
+          <TouchableOpacity
+            accessibilityRole="button"
+            accessibilityState={{ disabled: isSubmitting }}
+            disabled={isSubmitting}
+            style={modalStyles.cancelButton}
+            onPress={onClose}
+          >
             <Text style={modalStyles.cancelText}>Cancel</Text>
           </TouchableOpacity>
         </View>

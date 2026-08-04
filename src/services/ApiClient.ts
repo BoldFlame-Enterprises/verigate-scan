@@ -28,6 +28,33 @@ interface APIResponse<T> {
   error?: string;
   message?: string;
   code?: string;
+  request_id?: string;
+  correlation_id?: string;
+}
+
+export interface ApiTrace {
+  requestId?: string;
+  correlationId: string;
+}
+
+const SAFE_TRACE_ID = /^[A-Za-z0-9._:-]{1,64}$/;
+
+function safeTraceId(value: unknown): string | undefined {
+  return typeof value === 'string' && SAFE_TRACE_ID.test(value) ? value : undefined;
+}
+
+function traceForResponse<T>(
+  response: Awaited<ReturnType<typeof fetch>>,
+  json: APIResponse<T>,
+  sentCorrelationId: string
+): ApiTrace {
+  return {
+    requestId: safeTraceId(response.headers?.get?.('x-request-id'))
+      ?? safeTraceId(json.request_id),
+    correlationId: safeTraceId(response.headers?.get?.('x-correlation-id'))
+      ?? safeTraceId(json.correlation_id)
+      ?? sentCorrelationId,
+  };
 }
 
 type SessionKind = 'account' | 'device';
@@ -83,7 +110,9 @@ export class ApiError extends Error {
       ? 'session'
       : statusCode >= 400 && statusCode < 500
         ? 'validation'
-        : 'server'
+        : 'server',
+    public readonly requestId?: string,
+    public readonly correlationId?: string
   ) {
     super(message);
     this.name = 'ApiError';
@@ -93,7 +122,8 @@ export class ApiError extends Error {
 async function fetchJsonWithDeadline<T>(
   url: string,
   init: Record<string, unknown>,
-  timeoutMs: number
+  timeoutMs: number,
+  correlationId: string
 ): Promise<{ response: Awaited<ReturnType<typeof fetch>>; json: T }> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -105,7 +135,9 @@ async function fetchJsonWithDeadline<T>(
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       controller.abort();
-      reject(new ApiError(0, 'Request timed out', undefined, 'REQUEST_TIMEOUT', 'timeout'));
+      reject(new ApiError(
+        0, 'Request timed out', undefined, 'REQUEST_TIMEOUT', 'timeout', undefined, correlationId
+      ));
     }, Math.max(1, timeoutMs));
   });
   try {
@@ -117,7 +149,9 @@ async function fetchJsonWithDeadline<T>(
       error instanceof Error ? error.message : 'Network request failed',
       undefined,
       'NETWORK_ERROR',
-      'network'
+      'network',
+      undefined,
+      correlationId
     );
   } finally {
     if (timer) clearTimeout(timer);
@@ -130,6 +164,7 @@ class ApiClientClass {
   private tokenBinding: string | null = null;
   private sessionKind: SessionKind | null = null;
   private deviceEventId: number | null = null;
+  private lastTrace: ApiTrace | null = null;
 
   async loadTokens(): Promise<void> {
     const [accessToken, refreshToken, tokenBinding, sessionKind, deviceEventId] = await Promise.all([
@@ -161,6 +196,20 @@ class ApiClientClass {
 
   getDeviceEventId(): number | null {
     return this.sessionKind === 'device' ? this.deviceEventId : null;
+  }
+
+  getLastRequestTrace(): ApiTrace | null {
+    return this.lastTrace ? { ...this.lastTrace } : null;
+  }
+
+  private captureTrace<T>(
+    response: Awaited<ReturnType<typeof fetch>>,
+    json: APIResponse<T>,
+    correlationId: string
+  ): ApiTrace {
+    const trace = traceForResponse(response, json, correlationId);
+    this.lastTrace = trace;
+    return trace;
   }
 
   hasDeviceSession(): boolean {
@@ -196,6 +245,7 @@ class ApiClientClass {
     this.tokenBinding = null;
     this.sessionKind = null;
     this.deviceEventId = null;
+    this.lastTrace = null;
     await Promise.all([
       SecureStore.deleteItemAsync(ACCESS_TOKEN_KEY),
       SecureStore.deleteItemAsync(REFRESH_TOKEN_KEY),
@@ -208,10 +258,14 @@ class ApiClientClass {
   async logout(): Promise<void> {
     try {
       if (this.accessToken) {
+        const correlationId = Crypto.randomUUID();
         await fetchJsonWithDeadline(`${API_BASE_URL}/auth/logout`, {
           method: 'POST',
-          headers: { Authorization: `Bearer ${this.accessToken}` },
-        }, HEARTBEAT_TIMEOUT_MS).catch(() => undefined);
+          headers: {
+            Authorization: `Bearer ${this.accessToken}`,
+            'X-Correlation-Id': correlationId,
+          },
+        }, HEARTBEAT_TIMEOUT_MS, correlationId).catch(() => undefined);
       }
     } finally {
       await this.clearTokens();
@@ -219,15 +273,28 @@ class ApiClientClass {
   }
 
   async login(email: string, password: string): Promise<BackendUser> {
+    const correlationId = Crypto.randomUUID();
     const { response: res, json } = await fetchJsonWithDeadline<
       APIResponse<{ user: BackendUser; accessToken: string; refreshToken: string }>
     >(`${API_BASE_URL}/auth/login`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Correlation-Id': correlationId,
+      },
       body: JSON.stringify({ email, password, client_kind: 'scan' }),
-    }, LOGIN_TIMEOUT_MS);
+    }, LOGIN_TIMEOUT_MS, correlationId);
+    const trace = this.captureTrace(res, json, correlationId);
     if (!res.ok || !json.success || !json.data) {
-      throw new Error(json.error || 'Login failed');
+      throw new ApiError(
+        res.status,
+        json.error || 'Login failed',
+        undefined,
+        json.code,
+        undefined,
+        trace.requestId,
+        trace.correlationId
+      );
     }
     await this.setTokens(json.data.accessToken, json.data.refreshToken, {
       rotateBinding: true,
@@ -325,22 +392,32 @@ class ApiClientClass {
     // Audit credentials are deliberately kept in memory by their caller only.
   }
 
-  private async refresh(deadlineAt: number): Promise<boolean> {
+  private async refresh(deadlineAt: number, correlationId: string): Promise<boolean> {
     if (!this.refreshToken) return false;
     try {
       const remaining = deadlineAt - Date.now();
       if (remaining <= 0) {
-        throw new ApiError(0, 'Session refresh timed out', undefined, 'REQUEST_TIMEOUT', 'timeout');
+        throw new ApiError(
+          0, 'Session refresh timed out', undefined, 'REQUEST_TIMEOUT', 'timeout', undefined,
+          correlationId
+        );
       }
       const { response: res, json } = await fetchJsonWithDeadline<
         APIResponse<{ accessToken: string; refreshToken: string }>
       >(`${API_BASE_URL}/auth/refresh`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Correlation-Id': correlationId,
+        },
         body: JSON.stringify({ refreshToken: this.refreshToken }),
-      }, remaining);
+      }, remaining, correlationId);
+      const trace = this.captureTrace(res, json, correlationId);
       if (!res.ok || !json.success || !json.data) {
-        throw new ApiError(res.status, json.error || 'Session refresh failed', undefined, json.code);
+        throw new ApiError(
+          res.status, json.error || 'Session refresh failed', undefined, json.code, undefined,
+          trace.requestId, trace.correlationId
+        );
       }
       await this.setTokens(json.data.accessToken, json.data.refreshToken);
       return true;
@@ -362,36 +439,46 @@ class ApiClientClass {
       ? '?' + new URLSearchParams(Object.entries(options.params).map(([k, v]) => [k, String(v)])).toString()
       : '';
     const url = `${API_BASE_URL}${path}${query}`;
+    const correlationId = Crypto.randomUUID();
 
     const deadlineAt = Date.now() + (options.timeoutMs ?? REQUEST_TIMEOUT_MS);
     const doFetch = async () => {
       const remaining = deadlineAt - Date.now();
       if (remaining <= 0) {
-        throw new ApiError(0, `Request timed out: ${path}`, undefined, 'REQUEST_TIMEOUT', 'timeout');
+        throw new ApiError(
+          0, `Request timed out: ${path}`, undefined, 'REQUEST_TIMEOUT', 'timeout', undefined,
+          correlationId
+        );
       }
       return fetchJsonWithDeadline<APIResponse<T>>(url, {
         method: options.method || 'GET',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${this.accessToken}`,
+          'X-Correlation-Id': correlationId,
           ...(options.idempotencyKey ? { 'Idempotency-Key': options.idempotencyKey } : {}),
         },
         body: options.body ? JSON.stringify(options.body) : undefined,
-      }, remaining);
+      }, remaining, correlationId);
     };
 
     let { response: res, json } = await doFetch();
+    let trace = this.captureTrace(res, json, correlationId);
     if (res.status === 401) {
       const initialError = new ApiError(
         res.status,
         json.error || `Request failed: ${path}`,
         safeErrorData(json.data),
-        json.code
+        json.code,
+        undefined,
+        trace.requestId,
+        trace.correlationId
       );
       try {
-        const refreshed = await this.refresh(deadlineAt);
+        const refreshed = await this.refresh(deadlineAt, correlationId);
         if (refreshed) {
           ({ response: res, json } = await doFetch());
+          trace = this.captureTrace(res, json, correlationId);
         }
       } catch (refreshError) {
         throw initialError.code ? initialError : refreshError;
@@ -403,7 +490,10 @@ class ApiClientClass {
         res.status,
         json.error || `Request failed: ${path}`,
         safeErrorData(json.data),
-        json.code
+        json.code,
+        undefined,
+        trace.requestId,
+        trace.correlationId
       );
     }
     return json.data as T;
@@ -414,6 +504,7 @@ class ApiClientClass {
     path: string,
     options: { method?: string; body?: unknown } = {}
   ): Promise<T> {
+    const correlationId = Crypto.randomUUID();
     const { response, json } = await fetchJsonWithDeadline<APIResponse<T>>(
       `${API_BASE_URL}${path}`,
       {
@@ -421,17 +512,23 @@ class ApiClientClass {
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${accessToken}`,
+        'X-Correlation-Id': correlationId,
       },
       body: options.body ? JSON.stringify(options.body) : undefined,
       },
-      AUDIT_UPLOAD_TIMEOUT_MS
+      AUDIT_UPLOAD_TIMEOUT_MS,
+      correlationId
     );
+    const trace = this.captureTrace(response, json, correlationId);
     if (!response.ok || !json.success) {
       throw new ApiError(
         response.status,
         json.error || `Audit request failed: ${path}`,
         safeErrorData(json.data),
-        json.code
+        json.code,
+        undefined,
+        trace.requestId,
+        trace.correlationId
       );
     }
     return json.data as T;

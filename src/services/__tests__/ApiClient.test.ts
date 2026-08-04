@@ -21,9 +21,9 @@ const response = (status: number, body: unknown) => ({
 describe('ApiClient token binding', () => {
   beforeEach(async () => {
     mockStore.clear();
+    let sequence = 0;
     jest.mocked(Crypto.randomUUID).mockReset()
-      .mockReturnValueOnce('token-family-1')
-      .mockReturnValueOnce('token-family-2');
+      .mockImplementation(() => `uuid-${++sequence}`);
     global.fetch = jest.fn();
     await ApiClient.clearTokens();
   });
@@ -58,12 +58,13 @@ describe('ApiClient token binding', () => {
       }) as never);
 
     await ApiClient.login('scanner@example.com', 'password');
-    expect(ApiClient.getTokenBinding()).toBe('token-family-1');
+    const firstTokenBinding = ApiClient.getTokenBinding();
+    expect(firstTokenBinding).toMatch(/^uuid-/);
     await ApiClient.request('/events');
-    expect(ApiClient.getTokenBinding()).toBe('token-family-1');
+    expect(ApiClient.getTokenBinding()).toBe(firstTokenBinding);
 
     await ApiClient.login('scanner@example.com', 'password');
-    expect(ApiClient.getTokenBinding()).toBe('token-family-2');
+    expect(ApiClient.getTokenBinding()).not.toBe(firstTokenBinding);
     await ApiClient.clearTokens();
     expect(ApiClient.getTokenBinding()).toBeNull();
     expect(mockStore.has('verigate_scan_token_binding')).toBe(false);
@@ -187,5 +188,43 @@ describe('ApiClient token binding', () => {
 
     await rejection;
     jest.useRealTimers();
+  });
+
+  it('preserves one correlation ID across refresh and retry', async () => {
+    jest.mocked(global.fetch)
+      .mockResolvedValueOnce(response(200, {
+        success: true,
+        data: {
+          user: { id: 2, email: 'scanner@example.com', name: 'Scanner', phone: '1', role: 'scanner', is_active: true },
+          accessToken: 'access-1',
+          refreshToken: 'refresh-1',
+        },
+      }) as never)
+      .mockResolvedValueOnce(response(401, {
+        success: false,
+        request_id: 'request-attempt-1',
+      }) as never)
+      .mockResolvedValueOnce(response(200, {
+        success: true,
+        request_id: 'request-refresh',
+        data: { accessToken: 'access-2', refreshToken: 'refresh-2' },
+      }) as never)
+      .mockResolvedValueOnce(response(200, {
+        success: true,
+        request_id: 'request-attempt-2',
+        data: { ok: true },
+      }) as never);
+
+    await ApiClient.login('scanner@example.com', 'password');
+    await ApiClient.request('/events');
+
+    const operationCorrelationIds = [1, 2, 3].map((call) =>
+      (jest.mocked(global.fetch).mock.calls[call][1] as any).headers['X-Correlation-Id']
+    );
+    expect(new Set(operationCorrelationIds)).toEqual(new Set([operationCorrelationIds[0]]));
+    expect(ApiClient.getLastRequestTrace()).toEqual({
+      requestId: 'request-attempt-2',
+      correlationId: operationCorrelationIds[0],
+    });
   });
 });

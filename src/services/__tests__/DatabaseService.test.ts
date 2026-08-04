@@ -393,6 +393,12 @@ describe('DatabaseService event-scoped users', () => {
 
     await DatabaseService.promoteAuthorizationSnapshot({
       eventId: 11,
+      event: {
+        name: 'Operations',
+        is_active: true,
+        starts_at: '2026-07-29T00:00:00.000Z',
+        ends_at: '2026-07-30T00:00:00.000Z',
+      },
       trustGeneration: 8,
       users: [user(11)],
       areas: [{ id: 3, name: 'Arena', requires_scan: true }],
@@ -410,6 +416,7 @@ describe('DatabaseService event-scoped users', () => {
     expect(commands.map(([sql]) => compact(sql))).toEqual(expect.arrayContaining([
       expect.stringContaining('INSERT INTO users'),
       expect.stringContaining('INSERT INTO synced_areas'),
+      expect.stringContaining('INSERT INTO event_authority'),
       expect.stringContaining('INSERT INTO qr_authority_keys'),
       expect.stringContaining('INSERT INTO qr_revocations'),
       expect.stringContaining('INSERT INTO qr_trust_metadata'),
@@ -430,6 +437,12 @@ describe('DatabaseService event-scoped users', () => {
 
     await expect(DatabaseService.promoteAuthorizationSnapshot({
       eventId: 11,
+      event: {
+        name: 'Operations',
+        is_active: true,
+        starts_at: null,
+        ends_at: null,
+      },
       trustGeneration: 8,
       users: [user(11)],
       areas: [{ id: 3, name: 'Arena', requires_scan: true }],
@@ -462,6 +475,8 @@ describe('DatabaseService event-scoped users', () => {
       trust_generation: 8,
       user_snapshot_at: '2026-07-29T00:00:00.000Z',
       scanner_installation_id: 'scan-installation-1',
+      manual_reason: null,
+      identity_evidence_confirmed: false,
     });
     await DatabaseService.markScanLogSyncedByDeviceId('camera-attempt-1');
 
@@ -483,6 +498,8 @@ describe('DatabaseService event-scoped users', () => {
       null,
       'malformed_schema',
       'offline-current',
+      null,
+      0,
       8,
       '2026-07-29T00:00:00.000Z',
       'scan-installation-1',

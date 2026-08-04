@@ -9,7 +9,7 @@ jest.mock('expo-notifications', () => ({
   scheduleNotificationAsync: jest.fn(async () => 'notification-id'),
 }));
 jest.mock('react-native', () => ({ Platform: { OS: 'android' } }));
-jest.mock('../../config', () => ({ SYNC_STALE_WARNING_MS: 15 * 60 * 1000 }));
+jest.mock('../../config', () => ({ SYNC_STALE_WARNING_MS: 60 * 1000 }));
 
 import * as Notifications from 'expo-notifications';
 import { NotificationService } from '../NotificationService';
@@ -26,5 +26,15 @@ describe('NotificationService local lifecycle', () => {
     await expect(NotificationService.cancelStaleWarning()).resolves.toBeUndefined();
     expect(Notifications.cancelScheduledNotificationAsync).toHaveBeenNthCalledWith(1, 'sync-stale-warning');
     expect(Notifications.cancelScheduledNotificationAsync).toHaveBeenNthCalledWith(2, 'sync-stale-warning');
+  });
+
+  it('schedules the secondary warning at the decision freshness boundary', async () => {
+    await NotificationService.scheduleStaleWarning();
+    expect(Notifications.scheduleNotificationAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        identifier: 'sync-stale-warning',
+        trigger: expect.objectContaining({ seconds: 60 }),
+      })
+    );
   });
 });

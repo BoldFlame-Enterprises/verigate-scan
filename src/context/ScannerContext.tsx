@@ -27,7 +27,9 @@ interface ScannerContextType {
   lastScanResult: ScanResult | null;
   setLastScanResult: (result: ScanResult | null) => void;
   selectedArea: string | null;
-  setSelectedArea: (area: string | null) => void;
+  selectedAreaEventId: number | null;
+  setSelectedAreaForEvent: (eventId: number, area: string) => void;
+  clearSelectedArea: () => void;
   pendingAccountLogin: PendingAccountLogin | null;
   setPendingAccountLogin: (login: PendingAccountLogin | null) => void;
 }
@@ -51,6 +53,7 @@ export const ScannerProvider: React.FC<ScannerProviderProps> = ({ children }) =>
   const [scanCount, setScanCount] = useState<number>(0);
   const [lastScanResult, setLastScanResult] = useState<ScanResult | null>(null);
   const [selectedArea, setSelectedArea] = useState<string | null>(null);
+  const [selectedAreaEventId, setSelectedAreaEventId] = useState<number | null>(null);
   const [pendingAccountLogin, setPendingAccountLogin] = useState<PendingAccountLogin | null>(null);
 
   return (
@@ -65,7 +68,15 @@ export const ScannerProvider: React.FC<ScannerProviderProps> = ({ children }) =>
         lastScanResult,
         setLastScanResult,
         selectedArea,
-        setSelectedArea,
+        selectedAreaEventId,
+        setSelectedAreaForEvent: (eventId: number, area: string) => {
+          setSelectedAreaEventId(eventId);
+          setSelectedArea(area);
+        },
+        clearSelectedArea: () => {
+          setSelectedAreaEventId(null);
+          setSelectedArea(null);
+        },
         pendingAccountLogin,
         setPendingAccountLogin,
       }}

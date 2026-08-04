@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import {
   View,
   Text,
@@ -16,7 +16,7 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Crypto from 'expo-crypto';
 import { router } from 'expo-router';
 import { useScanner } from '../../src/context/ScannerContext';
-import { DatabaseService } from '../../src/services/DatabaseService';
+import { DatabaseService, EventAuthority } from '../../src/services/DatabaseService';
 import { SyncResult, SyncService } from '../../src/services/SyncService';
 import { SyncScheduler } from '../../src/services/SyncScheduler';
 import { NotificationService } from '../../src/services/NotificationService';
@@ -24,22 +24,44 @@ import { AudioFeedbackService } from '../../src/services/AudioFeedbackService';
 import { ApiClient } from '../../src/services/ApiClient';
 import { OfflineSessionService } from '../../src/services/OfflineSessionService';
 import { DeviceControlService } from '../../src/services/DeviceControlService';
+import {
+  durableDecisionAfterLocalFailure,
+  evaluateManualAssignment,
+  evaluateRecordingAuthority,
+  EventRecordingAuthority,
+  RecordingAuthorityInput,
+  recordingFreshness,
+} from '../../src/services/RecordingAuthorityService';
+import { DEMO_MODE } from '../../src/config';
 
 const { width } = Dimensions.get('window');
 
 type Modal_ = 'none' | 'manual' | 'override' | 'incident' | 'area';
 
 export default function ScannerScreen() {
-  const { scannerUser, setScannerUser, lastScanResult, setLastScanResult, selectedArea, setSelectedArea } = useScanner();
+  const {
+    scannerUser,
+    setScannerUser,
+    lastScanResult,
+    setLastScanResult,
+    selectedArea,
+    selectedAreaEventId,
+    setSelectedAreaForEvent,
+    clearSelectedArea,
+  } = useScanner();
   const [isScanning, setIsScanning] = useState(true);
   const [scanCount, setScanCount] = useState(0);
   const [permission, requestPermission] = useCameraPermissions();
   const [activeModal, setActiveModal] = useState<Modal_>('none');
-  const [availableAreas, setAvailableAreas] = useState<string[]>([]);
+  const [availableAreas, setAvailableAreas] = useState<{ id: number; name: string }[]>([]);
   const [eventId, setEventId] = useState<number | null>(null);
   const [eventName, setEventName] = useState<string | null>(null);
+  const [eventAuthority, setEventAuthority] = useState<EventAuthority | null>(null);
   const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [appState, setAppState] = useState(AppState.currentState);
+  const [authorityNow, setAuthorityNow] = useState(Date.now());
+  const [localAuditDegraded, setLocalAuditDegraded] = useState(false);
   const mountedRef = useRef(true);
   const syncedStateRefreshRef = useRef<(result?: SyncResult, promptForArea?: boolean) => Promise<void>>(async () => undefined);
   const authenticatedScannerId = scannerUser?.id;
@@ -71,10 +93,40 @@ export default function ScannerScreen() {
     setEventId(id);
     setEventName(name);
     setLastSyncAt(syncedAt ?? (result?.success ? Date.now() : null));
-    setAvailableAreas(visibleAreas);
-    if (promptForArea && !selectedArea && visibleAreas.length > 0) setActiveModal('area');
-    if (result?.success) await NotificationService.scheduleStaleWarning();
-  }, [scannerUser, selectedArea]);
+    const visibleRecords = areas.length > 0
+      ? areas.filter((area) => visibleAreas.includes(area.name))
+      : DEMO_MODE
+        ? visibleAreas.map((area, index) => ({ id: index + 1, name: area }))
+        : [];
+    const storedAuthority = id != null ? await DatabaseService.getEventAuthority(id) : null;
+    const resolvedAuthority = storedAuthority ?? (
+      DEMO_MODE && id != null
+        ? {
+            id,
+            name: name ?? `Event ${id}`,
+            is_active: true,
+            starts_at: null,
+            ends_at: null,
+            snapshot_at: new Date().toISOString(),
+          }
+        : null
+    );
+    setEventAuthority(resolvedAuthority);
+    setAvailableAreas(visibleRecords);
+    const areaIsCurrent = id != null && selectedAreaEventId === id &&
+      !!selectedArea && visibleRecords.some((area) => area.name === selectedArea);
+    if (!areaIsCurrent && selectedArea) clearSelectedArea();
+    if (promptForArea && !areaIsCurrent && visibleRecords.length > 0) setActiveModal('area');
+    if (result?.success) {
+      setLocalAuditDegraded(false);
+      await NotificationService.scheduleStaleWarning();
+    }
+  }, [clearSelectedArea, scannerUser, selectedArea, selectedAreaEventId]);
+
+  useEffect(() => {
+    const timer = setInterval(() => setAuthorityNow(Date.now()), 1_000);
+    return () => clearInterval(timer);
+  }, []);
 
   syncedStateRefreshRef.current = refreshSyncedState;
 
@@ -89,11 +141,13 @@ export default function ScannerScreen() {
   useEffect(() => {
     const handleRevocation = async () => {
       setIsScanning(false);
+      clearSelectedArea();
       setScannerUser(null);
       router.replace('/(auth)/login');
     };
     const unsubscribe = DeviceControlService.subscribe(() => handleRevocation());
     const appState = AppState.addEventListener('change', (state) => {
+      setAppState(state);
       if (state === 'active') void DeviceControlService.checkConnectedState();
     });
     void DeviceControlService.checkConnectedState();
@@ -101,7 +155,30 @@ export default function ScannerScreen() {
       unsubscribe();
       appState.remove();
     };
-  }, [setScannerUser]);
+  }, [clearSelectedArea, setScannerUser]);
+
+  const selectedAreaRecord = eventId != null && selectedAreaEventId === eventId
+    ? availableAreas.find((area) => area.name === selectedArea) ?? null
+    : null;
+  const baseAuthorityInput = useMemo<RecordingAuthorityInput>(() => ({
+    databaseReady: true,
+    appState,
+    blockingModal: false,
+    operationInFlight: false,
+    deviceSession: ApiClient.hasDeviceSession(),
+    revoked: scannerUser == null,
+    event: eventAuthority as EventRecordingAuthority | null,
+    selectedArea: selectedAreaRecord,
+    lastSyncAt,
+    now: authorityNow,
+    demoMode: DEMO_MODE,
+    auditHealthy: !localAuditDegraded,
+  }), [appState, authorityNow, eventAuthority, lastSyncAt, localAuditDegraded, scannerUser, selectedAreaRecord]);
+  const recordingAuthority = evaluateRecordingAuthority({
+    ...baseAuthorityInput,
+    blockingModal: activeModal !== 'none',
+    operationInFlight: !isScanning,
+  });
 
   useEffect(() => {
     if (!authenticatedScannerId || !ApiClient.isAuthenticated()) return;
@@ -133,18 +210,20 @@ export default function ScannerScreen() {
 
   const handleQRCodeScanned = useCallback(async ({ data }: { data: string }) => {
     if (!isScanning || !scannerUser) return;
+    if (!recordingAuthority.allowed || eventId == null || !selectedAreaRecord) {
+      Alert.alert(
+        'Scanning unavailable',
+        recordingAuthority.allowed
+          ? 'Select a current event area before scanning.'
+          : recordingAuthority.message
+      );
+      return;
+    }
 
-    const scanArea = selectedArea ?? scannerUser.allowed_areas[0];
-    if (!scanArea) {
-      Alert.alert('Error', 'No scanning area selected.');
-      return;
-    }
-    if (eventId == null) {
-      Alert.alert('Error', 'No bounded event session is available. Sign in and sync first.');
-      return;
-    }
+    const scanArea = selectedAreaRecord.name;
 
     setIsScanning(false);
+    let durableServerDecision: { success: boolean; message: string; userName?: string } | null = null;
 
     try {
       const deviceScanId = Crypto.randomUUID();
@@ -223,6 +302,15 @@ export default function ScannerScreen() {
               server.persistence?.client_record_id === deviceScanId &&
               (server.persistence.status === 'accepted' ||
                 server.persistence.status === 'duplicate');
+            if (fallbackAcknowledged) {
+              durableServerDecision = {
+                success: verification.success,
+                message: verification.success
+                  ? `Access GRANTED for ${verification.user?.name ?? 'attendee'}`
+                  : `Access DENIED: ${verification.reason ?? 'Denied by current server authority'}`,
+                userName: verification.user?.name,
+              };
+            }
           } catch {
             verification = {
               ...local,
@@ -262,6 +350,7 @@ export default function ScannerScreen() {
         user_snapshot_at: lastSyncAt ? new Date(lastSyncAt).toISOString() : null,
         scanner_installation_id: scannerInstallationId,
       });
+      setLocalAuditDegraded(false);
       if (fallbackAcknowledged) {
         await DatabaseService.markScanLogSyncedByDeviceId(deviceScanId);
       }
@@ -290,6 +379,20 @@ export default function ScannerScreen() {
 
     } catch (error) {
       console.error('QR verification failed:', error);
+      if (durableServerDecision) {
+        const preserved = durableDecisionAfterLocalFailure(durableServerDecision, error);
+        setLocalAuditDegraded(true);
+        setIsScanning(true);
+        setLastScanResult({
+          success: preserved.success,
+          message: preserved.message,
+          userName: preserved.userName,
+          timestamp: new Date(),
+        });
+        if (preserved.success) AudioFeedbackService.playGranted();
+        else AudioFeedbackService.playDenied();
+        return;
+      }
       AudioFeedbackService.playDenied();
       setLastScanResult({
         success: false,
@@ -302,7 +405,7 @@ export default function ScannerScreen() {
         setIsScanning(true);
       }, 2000);
     }
-  }, [eventId, isScanning, lastSyncAt, scannerUser, selectedArea, setLastScanResult]);
+  }, [eventId, isScanning, lastSyncAt, recordingAuthority, scannerUser, selectedAreaRecord, setLastScanResult]);
 
   const handleLogout = () => {
     Alert.alert(
@@ -319,6 +422,7 @@ export default function ScannerScreen() {
             await DatabaseService.clearScannerCredentials();
             await OfflineSessionService.clear();
             await ApiClient.logout();
+            clearSelectedArea();
             setScannerUser(null);
             router.replace('/(auth)/login');
           },
@@ -369,7 +473,7 @@ export default function ScannerScreen() {
         <CameraView
           style={styles.camera}
           facing="back"
-          onBarcodeScanned={isScanning ? handleQRCodeScanned : undefined}
+          onBarcodeScanned={isScanning && recordingAuthority.allowed ? handleQRCodeScanned : undefined}
           barcodeScannerSettings={{
             barcodeTypes: ['qr'],
           }}
@@ -378,7 +482,7 @@ export default function ScannerScreen() {
         <View style={styles.overlay}>
           <View style={styles.scanArea} />
           <Text style={styles.scanInstructions}>
-            Point camera at QR code
+            {recordingAuthority.allowed ? 'Point camera at QR code' : recordingAuthority.message}
           </Text>
         </View>
 
@@ -415,6 +519,9 @@ export default function ScannerScreen() {
             <Text style={styles.syncStatusText}>Event: {eventName ?? 'not selected'}</Text>
             <Text style={styles.syncStatusText}>
               Last sync: {lastSyncAt ? new Date(lastSyncAt).toLocaleTimeString() : 'never'}
+            </Text>
+            <Text style={styles.syncStatusText} accessibilityLiveRegion="polite">
+              Authority: {recordingFreshness(lastSyncAt, authorityNow).replace('-', ' ')}
             </Text>
           </View>
 
@@ -493,9 +600,9 @@ export default function ScannerScreen() {
 
       <AreaPickerModal
         visible={activeModal === 'area'}
-        areas={availableAreas}
+        areas={availableAreas.map((area) => area.name)}
         onSelect={(area) => {
-          setSelectedArea(area);
+          if (eventId != null) setSelectedAreaForEvent(eventId, area);
           setActiveModal('none');
         }}
         onClose={() => setActiveModal('none')}
@@ -506,6 +613,8 @@ export default function ScannerScreen() {
         area={selectedArea ?? scannerUser?.allowed_areas[0] ?? ''}
         scannerName={scannerUser?.name ?? 'Unknown'}
         eventId={eventId}
+        authorityInput={baseAuthorityInput}
+        lastSyncAt={lastSyncAt}
         onClose={() => setActiveModal('none')}
         onResult={(result) => {
           setActiveModal('none');
@@ -520,6 +629,7 @@ export default function ScannerScreen() {
         visible={activeModal === 'override'}
         area={selectedArea ?? scannerUser?.allowed_areas[0] ?? ''}
         eventId={eventId}
+        authorityInput={baseAuthorityInput}
         onClose={() => setActiveModal('none')}
       />
 
@@ -527,6 +637,7 @@ export default function ScannerScreen() {
         visible={activeModal === 'incident'}
         area={selectedArea ?? undefined}
         eventId={eventId}
+        authorityInput={baseAuthorityInput}
         onClose={() => setActiveModal('none')}
       />
     </View>
@@ -569,6 +680,8 @@ function ManualEntryModal({
   area,
   scannerName,
   eventId,
+  authorityInput,
+  lastSyncAt,
   onClose,
   onResult,
 }: {
@@ -576,49 +689,95 @@ function ManualEntryModal({
   area: string;
   scannerName: string;
   eventId: number | null;
+  authorityInput: RecordingAuthorityInput;
+  lastSyncAt: number | null;
   onClose: () => void;
   onResult: (result: { success: boolean; message: string; userName?: string; timestamp: Date }) => void;
 }) {
   const [email, setEmail] = useState('');
+  const [reason, setReason] = useState('');
+  const [identityEvidenceConfirmed, setIdentityEvidenceConfirmed] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const handleSubmit = async () => {
+    if (isSubmitting) return;
     if (!email.trim()) {
       Alert.alert('Error', 'Enter the attendee email printed on their badge/ID.');
       return;
     }
 
-    if (eventId == null) {
-      onResult({ success: false, message: 'No bounded event session is available', timestamp: new Date() });
+    if (reason.trim().length < 3) {
+      Alert.alert('Reason required', 'Record why cryptographic QR verification cannot be used.');
       return;
     }
-    const user = await DatabaseService.getUserByEmail(email.toLowerCase().trim(), eventId);
-    if (!user) {
-      onResult({ success: false, message: 'No matching attendee found for manual entry', timestamp: new Date() });
+    if (!identityEvidenceConfirmed) {
+      Alert.alert('Identity evidence required', 'Confirm that the attendee identity was checked using approved evidence.');
+      return;
+    }
+    const authority = evaluateRecordingAuthority({
+      ...authorityInput,
+      blockingModal: false,
+      operationInFlight: false,
+    });
+    if (!authority.allowed || eventId == null || !authorityInput.selectedArea) {
+      onResult({
+        success: false,
+        message: authority.allowed ? 'No current event area is available' : authority.message,
+        timestamp: new Date(),
+      });
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      const recordedAt = new Date();
+      const user = await DatabaseService.getUserByEmail(email.toLowerCase().trim(), eventId);
+      const decision = user
+        ? evaluateManualAssignment(user, eventId, authorityInput.selectedArea.id, recordedAt.getTime())
+        : {
+            granted: false as const,
+            code: 'manual_subject_missing',
+            reason: 'No matching active attendee exists in the current event snapshot.',
+          };
+      const deviceScanId = Crypto.randomUUID();
+      await DatabaseService.logScan({
+        event_id: eventId,
+        user_id: user?.id ?? null,
+        user_name: user?.name ?? null,
+        area,
+        area_id: authorityInput.selectedArea.id,
+        access_granted: decision.granted,
+        failure_reason: decision.granted ? undefined : decision.reason,
+        scanned_at: recordedAt.toISOString(),
+        scanner_user: `${scannerName} (manual)`,
+        device_scan_id: deviceScanId,
+        decision_code: decision.code,
+        decision_source: 'manual',
+        manual_reason: reason.trim(),
+        identity_evidence_confirmed: true,
+        user_snapshot_at: lastSyncAt ? new Date(lastSyncAt).toISOString() : null,
+        scanner_installation_id: await SyncService.getDeviceId(),
+      });
+
+      onResult({
+        success: decision.granted,
+        message: decision.granted
+          ? `Manual entry: access GRANTED for ${user?.name}`
+          : `Manual entry: access DENIED: ${decision.reason}`,
+        userName: user?.name,
+        timestamp: recordedAt,
+      });
       setEmail('');
-      return;
+      setReason('');
+      setIdentityEvidenceConfirmed(false);
+    } catch (error) {
+      onResult({
+        success: false,
+        message: error instanceof Error ? error.message : 'Manual decision could not be recorded',
+        timestamp: new Date(),
+      });
+    } finally {
+      setIsSubmitting(false);
     }
-
-    const granted = user.allowed_areas.includes(area);
-    const areas = await DatabaseService.getSyncedAreas(eventId);
-    await DatabaseService.logScan({
-      event_id: eventId,
-      user_id: user.id,
-      user_name: user.name,
-      area,
-      area_id: areas.find((item) => item.name === area)?.id,
-      access_granted: granted,
-      failure_reason: granted ? undefined : `No access to ${area} (manual entry)`,
-      scanned_at: new Date().toISOString(),
-      scanner_user: `${scannerName} (manual)`,
-    });
-
-    onResult({
-      success: granted,
-      message: granted ? `Manual entry: access GRANTED for ${user.name}` : `Manual entry: access DENIED for ${user.name}`,
-      userName: user.name,
-      timestamp: new Date(),
-    });
-    setEmail('');
   };
 
   return (
@@ -636,8 +795,19 @@ function ManualEntryModal({
             value={email}
             onChangeText={setEmail}
           />
-          <TouchableOpacity style={modalStyles.submitButton} onPress={handleSubmit}>
-            <Text style={modalStyles.submitText}>Verify</Text>
+          <TextInput
+            style={modalStyles.input}
+            placeholder="Reason QR verification cannot be used"
+            placeholderTextColor="#6b7280"
+            value={reason}
+            onChangeText={setReason}
+          />
+          <View style={modalStyles.switchRow}>
+            <Text style={modalStyles.optionText}>Approved identity evidence checked</Text>
+            <Switch value={identityEvidenceConfirmed} onValueChange={setIdentityEvidenceConfirmed} />
+          </View>
+          <TouchableOpacity style={modalStyles.submitButton} onPress={handleSubmit} disabled={isSubmitting}>
+            <Text style={modalStyles.submitText}>{isSubmitting ? 'Recording...' : 'Verify and record'}</Text>
           </TouchableOpacity>
           <TouchableOpacity style={modalStyles.cancelButton} onPress={onClose}>
             <Text style={modalStyles.cancelText}>Cancel</Text>
@@ -652,11 +822,13 @@ function OverrideModal({
   visible,
   area,
   eventId,
+  authorityInput,
   onClose,
 }: {
   visible: boolean;
   area: string;
   eventId: number | null;
+  authorityInput: RecordingAuthorityInput;
   onClose: () => void;
 }) {
   const [email, setEmail] = useState('');
@@ -666,6 +838,15 @@ function OverrideModal({
   const handleSubmit = async () => {
     if (reason.trim().length < 3) {
       Alert.alert('Reason required', 'A mandatory reason (at least a few words) must be logged for every emergency override.');
+      return;
+    }
+    const authority = evaluateRecordingAuthority({
+      ...authorityInput,
+      blockingModal: false,
+      operationInFlight: false,
+    });
+    if (!authority.allowed) {
+      Alert.alert('Override unavailable', authority.message);
       return;
     }
     if (!eventId) {
@@ -728,11 +909,13 @@ function IncidentModal({
   visible,
   area,
   eventId,
+  authorityInput,
   onClose,
 }: {
   visible: boolean;
   area?: string;
   eventId: number | null;
+  authorityInput: RecordingAuthorityInput;
   onClose: () => void;
 }) {
   const [category, setCategory] = useState('suspicious_activity');
@@ -741,6 +924,15 @@ function IncidentModal({
   const handleSubmit = async () => {
     if (description.trim().length < 5) {
       Alert.alert('Description required', 'Please describe the incident in a bit more detail.');
+      return;
+    }
+    const authority = evaluateRecordingAuthority({
+      ...authorityInput,
+      blockingModal: false,
+      operationInFlight: false,
+    });
+    if (!authority.allowed) {
+      Alert.alert('Incident recording unavailable', authority.message);
       return;
     }
     if (!eventId) {

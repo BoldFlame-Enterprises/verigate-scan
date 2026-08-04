@@ -65,6 +65,7 @@ import { ApiClient, ApiError } from '../ApiClient';
 import { DatabaseService } from '../DatabaseService';
 import { SyncService } from '../SyncService';
 import { OfflineSessionService } from '../OfflineSessionService';
+import * as SecureStore from 'expo-secure-store';
 
 const trustPage = {
   contract_version: 'qr-trust-v1',
@@ -82,6 +83,11 @@ const trustPage = {
 describe('SyncService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    jest.mocked(SecureStore.getItemAsync).mockImplementation(async (key) => {
+      if (key === 'verigate_scan_event_active') return 'true';
+      if (key === 'verigate_scan_event_name') return 'Event 6';
+      return null;
+    });
     jest.mocked(DatabaseService.getUnsyncedScanLogs).mockResolvedValue([]);
     jest.mocked(DatabaseService.getUnsyncedIncidents).mockResolvedValue([]);
     jest.mocked(DatabaseService.getUnsyncedOverrides).mockResolvedValue([]);
@@ -104,6 +110,12 @@ describe('SyncService', () => {
     expect(ApiClient.request).not.toHaveBeenCalledWith('/events');
     expect(DatabaseService.promoteAuthorizationSnapshot).toHaveBeenCalledWith({
       eventId: 6,
+      event: {
+        name: 'Event 6',
+        is_active: true,
+        starts_at: null,
+        ends_at: null,
+      },
       trustGeneration: 2,
       users,
       areas,

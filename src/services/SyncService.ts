@@ -14,13 +14,17 @@ import { DeviceIdentityService } from './DeviceIdentityService';
 
 const CURRENT_EVENT_ID_KEY = 'verigate_scan_event_id';
 const CURRENT_EVENT_NAME_KEY = 'verigate_scan_event_name';
+const CURRENT_EVENT_STARTS_AT_KEY = 'verigate_scan_event_starts_at';
 const CURRENT_EVENT_ENDS_AT_KEY = 'verigate_scan_event_ends_at';
+const CURRENT_EVENT_ACTIVE_KEY = 'verigate_scan_event_active';
 const LAST_SYNC_AT_KEY = 'verigate_scan_last_sync_at';
 
-interface RemoteEvent {
+export interface RemoteEvent {
   id: number;
   name: string;
+  starts_at: string | null;
   ends_at: string | null;
+  is_active: boolean;
 }
 
 export interface SyncResult {
@@ -149,9 +153,13 @@ class SyncServiceClass {
     await Promise.all([
       SecureStore.setItemAsync(CURRENT_EVENT_ID_KEY, String(event.id)),
       SecureStore.setItemAsync(CURRENT_EVENT_NAME_KEY, event.name),
+      event.starts_at
+        ? SecureStore.setItemAsync(CURRENT_EVENT_STARTS_AT_KEY, event.starts_at)
+        : SecureStore.deleteItemAsync(CURRENT_EVENT_STARTS_AT_KEY),
       event.ends_at
         ? SecureStore.setItemAsync(CURRENT_EVENT_ENDS_AT_KEY, event.ends_at)
         : SecureStore.deleteItemAsync(CURRENT_EVENT_ENDS_AT_KEY),
+      SecureStore.setItemAsync(CURRENT_EVENT_ACTIVE_KEY, event.is_active ? 'true' : 'false'),
     ]);
   }
 
@@ -159,7 +167,9 @@ class SyncServiceClass {
     await Promise.all([
       SecureStore.deleteItemAsync(CURRENT_EVENT_ID_KEY),
       SecureStore.deleteItemAsync(CURRENT_EVENT_NAME_KEY),
+      SecureStore.deleteItemAsync(CURRENT_EVENT_STARTS_AT_KEY),
       SecureStore.deleteItemAsync(CURRENT_EVENT_ENDS_AT_KEY),
+      SecureStore.deleteItemAsync(CURRENT_EVENT_ACTIVE_KEY),
       SecureStore.deleteItemAsync(LAST_SYNC_AT_KEY),
     ]);
   }
@@ -183,7 +193,9 @@ class SyncServiceClass {
       const event: RemoteEvent = {
         id: eventId,
         name: await this.getCurrentEventName() ?? `Event ${eventId}`,
+        starts_at: await SecureStore.getItemAsync(CURRENT_EVENT_STARTS_AT_KEY),
         ends_at: await SecureStore.getItemAsync(CURRENT_EVENT_ENDS_AT_KEY),
+        is_active: (await SecureStore.getItemAsync(CURRENT_EVENT_ACTIVE_KEY)) === 'true',
       };
 
       const [usersData, areasData] = await Promise.all([
@@ -197,6 +209,12 @@ class SyncServiceClass {
       const trustGeneration = await this.syncQrTrust(eventId);
       await DatabaseService.promoteAuthorizationSnapshot({
         eventId,
+        event: {
+          name: event.name,
+          is_active: event.is_active,
+          starts_at: event.starts_at,
+          ends_at: event.ends_at,
+        },
         trustGeneration,
         users: usersData.users,
         areas: areasData.areas,
@@ -384,6 +402,8 @@ class SyncServiceClass {
               nonce_hash: record.nonce_hash,
               decision_code: record.decision_code,
               decision_source: record.decision_source,
+              manual_reason: record.manual_reason,
+              identity_evidence_confirmed: record.identity_evidence_confirmed,
               trust_generation: record.trust_generation,
               user_snapshot_at: record.user_snapshot_at,
               device_info: {
@@ -505,6 +525,8 @@ class SyncServiceClass {
           nonce_hash: log.nonce_hash,
           decision_code: log.decision_code,
           decision_source: log.decision_source,
+          manual_reason: log.manual_reason,
+          identity_evidence_confirmed: log.identity_evidence_confirmed,
           trust_generation: log.trust_generation,
           user_snapshot_at: log.user_snapshot_at,
           device_info: {

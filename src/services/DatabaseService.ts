@@ -44,6 +44,15 @@ export interface ScannerUser {
   allowed_areas: string[];
 }
 
+export interface EventAuthority {
+  id: number;
+  name: string;
+  is_active: boolean;
+  starts_at: string | null;
+  ends_at: string | null;
+  snapshot_at: string;
+}
+
 export interface ScanLog {
   id?: number;
   event_id: number;
@@ -59,7 +68,9 @@ export interface ScanLog {
   credential_id?: string | null;
   nonce_hash?: string | null;
   decision_code?: string | null;
-  decision_source?: 'offline-current' | 'offline-stale' | 'server';
+  decision_source?: 'offline-current' | 'offline-stale' | 'server' | 'manual';
+  manual_reason?: string | null;
+  identity_evidence_confirmed?: boolean | null;
   trust_generation?: number | null;
   user_snapshot_at?: string | null;
   scanner_installation_id?: string | null;
@@ -278,6 +289,8 @@ class DatabaseServiceClass {
         nonce_hash TEXT,
         decision_code TEXT,
         decision_source TEXT,
+        manual_reason TEXT,
+        identity_evidence_confirmed INTEGER,
         trust_generation INTEGER,
         user_snapshot_at TEXT,
         scanner_installation_id TEXT,
@@ -355,6 +368,17 @@ class DatabaseServiceClass {
     `);
 
     await this.database.execAsync(`
+      CREATE TABLE IF NOT EXISTS event_authority (
+        event_id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        is_active INTEGER NOT NULL,
+        starts_at TEXT,
+        ends_at TEXT,
+        snapshot_at TEXT NOT NULL
+      );
+    `);
+
+    await this.database.execAsync(`
       CREATE TABLE IF NOT EXISTS qr_trust_metadata (
         event_id INTEGER PRIMARY KEY,
         generation INTEGER NOT NULL,
@@ -418,6 +442,8 @@ class DatabaseServiceClass {
     await this.addColumnIfMissing('scan_logs', 'acknowledged_at', 'TEXT');
     await this.addColumnIfMissing('scan_logs', 'server_id', 'INTEGER');
     await this.addColumnIfMissing('scan_logs', 'terminal_reason', 'TEXT');
+    await this.addColumnIfMissing('scan_logs', 'manual_reason', 'TEXT');
+    await this.addColumnIfMissing('scan_logs', 'identity_evidence_confirmed', 'INTEGER');
     await this.database.execAsync(`
       UPDATE scan_logs
       SET upload_state = CASE WHEN synced = 1 THEN 'acknowledged' ELSE 'pending' END
@@ -892,10 +918,11 @@ class DatabaseServiceClass {
     await this.database.runAsync(
       `INSERT INTO scan_logs
          (event_id, user_id, user_name, area, area_id, access_granted,
-          failure_reason, scanned_at, scanner_user, device_scan_id,
-          credential_id, nonce_hash, decision_code, decision_source,
-          trust_generation, user_snapshot_at, scanner_installation_id, synced)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+           failure_reason, scanned_at, scanner_user, device_scan_id,
+           credential_id, nonce_hash, decision_code, decision_source,
+           manual_reason, identity_evidence_confirmed, trust_generation,
+           user_snapshot_at, scanner_installation_id, synced)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
       [
         scanLog.event_id,
         scanLog.user_id,
@@ -911,6 +938,10 @@ class DatabaseServiceClass {
         scanLog.nonce_hash ?? null,
         scanLog.decision_code ?? null,
         scanLog.decision_source ?? null,
+        scanLog.manual_reason ?? null,
+        scanLog.identity_evidence_confirmed == null
+          ? null
+          : scanLog.identity_evidence_confirmed ? 1 : 0,
         scanLog.trust_generation ?? null,
         scanLog.user_snapshot_at ?? null,
         scanLog.scanner_installation_id ?? null
@@ -971,6 +1002,12 @@ class DatabaseServiceClass {
 
   async promoteAuthorizationSnapshot(input: {
     eventId: number;
+    event: {
+      name: string;
+      is_active: boolean;
+      starts_at: string | null;
+      ends_at: string | null;
+    };
     trustGeneration: number;
     users: User[];
     areas: { id: number; name: string; requires_scan: boolean }[];
@@ -1021,6 +1058,26 @@ class DatabaseServiceClass {
         [area.id, input.eventId, area.name, area.requires_scan ? 1 : 0],
       ]);
     }
+    const snapshotAt = new Date().toISOString();
+    commands.push([
+      `INSERT INTO event_authority
+         (event_id, name, is_active, starts_at, ends_at, snapshot_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(event_id) DO UPDATE SET
+         name = excluded.name,
+         is_active = excluded.is_active,
+         starts_at = excluded.starts_at,
+         ends_at = excluded.ends_at,
+         snapshot_at = excluded.snapshot_at`,
+      [
+        input.eventId,
+        input.event.name,
+        input.event.is_active ? 1 : 0,
+        input.event.starts_at,
+        input.event.ends_at,
+        snapshotAt,
+      ],
+    ]);
     commands.push(
       [
         `INSERT INTO qr_authority_keys (event_id, kid, public_key, status, verify_until)
@@ -1118,6 +1175,30 @@ class DatabaseServiceClass {
     return result.map((row) => ({ id: row.id, name: row.name }));
   }
 
+  async getEventAuthority(eventId: number): Promise<EventAuthority | null> {
+    if (!this.database) throw new Error('Database not initialized');
+    const row = await this.database.getFirstAsync(
+      `SELECT event_id, name, is_active, starts_at, ends_at, snapshot_at
+       FROM event_authority WHERE event_id = ?`,
+      [eventId]
+    ) as {
+      event_id: number;
+      name: string;
+      is_active: number;
+      starts_at: string | null;
+      ends_at: string | null;
+      snapshot_at: string;
+    } | null;
+    return row ? {
+      id: row.event_id,
+      name: row.name,
+      is_active: row.is_active === 1,
+      starts_at: row.starts_at,
+      ends_at: row.ends_at,
+      snapshot_at: row.snapshot_at,
+    } : null;
+  }
+
   async getUnsyncedScanLogs(limit = 25, eventId?: number): Promise<(ScanLog & { id: number })[]> {
     if (!this.database) {
       throw new Error('Database not initialized');
@@ -1147,6 +1228,10 @@ class DatabaseServiceClass {
       nonce_hash: row.nonce_hash,
       decision_code: row.decision_code,
       decision_source: row.decision_source,
+      manual_reason: row.manual_reason,
+      identity_evidence_confirmed: row.identity_evidence_confirmed == null
+        ? null
+        : row.identity_evidence_confirmed === 1,
       trust_generation: row.trust_generation,
       user_snapshot_at: row.user_snapshot_at,
       scanner_installation_id: row.scanner_installation_id,
@@ -1189,6 +1274,10 @@ class DatabaseServiceClass {
       nonce_hash: row.nonce_hash,
       decision_code: row.decision_code,
       decision_source: row.decision_source,
+      manual_reason: row.manual_reason,
+      identity_evidence_confirmed: row.identity_evidence_confirmed == null
+        ? null
+        : row.identity_evidence_confirmed === 1,
       trust_generation: row.trust_generation,
       user_snapshot_at: row.user_snapshot_at,
       scanner_installation_id: row.scanner_installation_id,

@@ -5,6 +5,9 @@ jest.mock('@/services/ApiClient', () => ({
 jest.mock('@/services/DatabaseService', () => ({
   DatabaseService: { initDatabase: jest.fn() },
 }));
+jest.mock('@/services/DeregistrationAuditService', () => ({
+  DeregistrationAuditService: { resume: jest.fn() },
+}));
 
 import {
   appInitializationReducer,

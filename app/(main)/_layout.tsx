@@ -21,6 +21,10 @@ export default function MainLayout() {
           headerLeft: () => null, // Prevent going back
         }} 
       />
+      <Stack.Screen
+        name="queue-status"
+        options={{ title: 'Audit Queue Health' }}
+      />
     </Stack>
   );
 }

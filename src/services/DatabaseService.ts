@@ -116,6 +116,23 @@ export interface QueuedOverride {
   terminal_failure: boolean;
 }
 
+export interface QueueHealth {
+  pending: number;
+  retrying: number;
+  terminal: number;
+  quarantined: number;
+  acknowledged: number;
+  unresolved: number;
+}
+
+export interface QueueDiagnostic {
+  kind: 'scan' | 'incident' | 'override';
+  recordId: string;
+  state: 'pending' | 'retrying' | 'terminal' | 'quarantined';
+  occurredAt: string;
+  errorCode: string | null;
+}
+
 export interface QrTrustPage {
   contract_version: 'qr-trust-v1';
   event_id: number;
@@ -458,12 +475,16 @@ class DatabaseServiceClass {
     await this.addColumnIfMissing('incidents_queue', 'last_attempt_at', 'TEXT');
     await this.addColumnIfMissing('incidents_queue', 'last_error', 'TEXT');
     await this.addColumnIfMissing('incidents_queue', 'terminal_failure', 'INTEGER NOT NULL DEFAULT 0');
+    await this.addColumnIfMissing('incidents_queue', 'quarantined', 'INTEGER NOT NULL DEFAULT 0');
+    await this.addColumnIfMissing('incidents_queue', 'quarantine_reason', 'TEXT');
     await this.addColumnIfMissing('overrides_queue', 'client_record_id', 'TEXT');
     await this.addColumnIfMissing('overrides_queue', 'occurred_at', 'TEXT');
     await this.addColumnIfMissing('overrides_queue', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
     await this.addColumnIfMissing('overrides_queue', 'last_attempt_at', 'TEXT');
     await this.addColumnIfMissing('overrides_queue', 'last_error', 'TEXT');
     await this.addColumnIfMissing('overrides_queue', 'terminal_failure', 'INTEGER NOT NULL DEFAULT 0');
+    await this.addColumnIfMissing('overrides_queue', 'quarantined', 'INTEGER NOT NULL DEFAULT 0');
+    await this.addColumnIfMissing('overrides_queue', 'quarantine_reason', 'TEXT');
     const unresolvedLegacyIdentities = await this.database.getFirstAsync(
       `SELECT
          (SELECT COUNT(*) FROM incidents_queue
@@ -1199,6 +1220,128 @@ class DatabaseServiceClass {
     } : null;
   }
 
+  async getQueueHealth(eventId: number): Promise<QueueHealth> {
+    if (!this.database) throw new Error('Database not initialized');
+    const scan = await this.database.getFirstAsync(
+      `SELECT
+         COALESCE(SUM(CASE WHEN upload_state = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
+         COALESCE(SUM(CASE WHEN upload_state IN ('retryable', 'processing') THEN 1 ELSE 0 END), 0) AS retrying,
+         COALESCE(SUM(CASE WHEN upload_state = 'terminal' THEN 1 ELSE 0 END), 0) AS terminal,
+         COALESCE(SUM(CASE WHEN upload_state = 'quarantined' THEN 1 ELSE 0 END), 0) AS quarantined,
+         COALESCE(SUM(CASE WHEN upload_state = 'acknowledged' OR synced = 1 THEN 1 ELSE 0 END), 0) AS acknowledged
+       FROM scan_logs WHERE event_id = ?`,
+      [eventId]
+    ) as Omit<QueueHealth, 'unresolved'> | null;
+    const incident = await this.auxiliaryQueueHealth('incidents_queue', eventId);
+    const override = await this.auxiliaryQueueHealth('overrides_queue', eventId);
+    const rows = [scan, incident, override].map((row) => row ?? {
+      pending: 0,
+      retrying: 0,
+      terminal: 0,
+      quarantined: 0,
+      acknowledged: 0,
+    });
+    const combined = rows.reduce((total, row) => ({
+      pending: total.pending + Number(row.pending || 0),
+      retrying: total.retrying + Number(row.retrying || 0),
+      terminal: total.terminal + Number(row.terminal || 0),
+      quarantined: total.quarantined + Number(row.quarantined || 0),
+      acknowledged: total.acknowledged + Number(row.acknowledged || 0),
+    }), { pending: 0, retrying: 0, terminal: 0, quarantined: 0, acknowledged: 0 });
+    return {
+      ...combined,
+      unresolved: combined.pending + combined.retrying + combined.terminal + combined.quarantined,
+    };
+  }
+
+  private async auxiliaryQueueHealth(
+    table: 'incidents_queue' | 'overrides_queue',
+    eventId: number
+  ): Promise<Omit<QueueHealth, 'unresolved'> | null> {
+    if (!this.database) throw new Error('Database not initialized');
+    return this.database.getFirstAsync(
+      `SELECT
+         COALESCE(SUM(CASE WHEN synced = 0 AND terminal_failure = 0 AND quarantined = 0 AND attempt_count = 0 THEN 1 ELSE 0 END), 0) AS pending,
+         COALESCE(SUM(CASE WHEN synced = 0 AND terminal_failure = 0 AND quarantined = 0 AND attempt_count > 0 THEN 1 ELSE 0 END), 0) AS retrying,
+         COALESCE(SUM(CASE WHEN terminal_failure = 1 AND quarantined = 0 THEN 1 ELSE 0 END), 0) AS terminal,
+         COALESCE(SUM(CASE WHEN quarantined = 1 THEN 1 ELSE 0 END), 0) AS quarantined,
+         COALESCE(SUM(CASE WHEN synced = 1 THEN 1 ELSE 0 END), 0) AS acknowledged
+       FROM ${table} WHERE event_id = ?`,
+      [eventId]
+    ) as Promise<Omit<QueueHealth, 'unresolved'> | null>;
+  }
+
+  async getQueueDiagnostics(eventId: number, limit = 50): Promise<QueueDiagnostic[]> {
+    if (!this.database) throw new Error('Database not initialized');
+    const safeLimit = Math.max(1, Math.min(100, Math.floor(limit)));
+    const [scans, incidents, overrides] = await Promise.all([
+      this.database.getAllAsync(
+        `SELECT device_scan_id AS record_id,
+                CASE WHEN upload_state = 'processing' THEN 'retrying' ELSE upload_state END AS state,
+                scanned_at AS occurred_at,
+                last_error_code AS error_code
+         FROM scan_logs
+         WHERE event_id = ? AND upload_state != 'acknowledged' AND synced = 0
+         ORDER BY scanned_at ASC LIMIT ?`,
+        [eventId, safeLimit]
+      ),
+      this.database.getAllAsync(
+        `SELECT client_record_id AS record_id,
+                CASE WHEN quarantined = 1 THEN 'quarantined'
+                     WHEN terminal_failure = 1 THEN 'terminal'
+                     WHEN attempt_count > 0 THEN 'retrying' ELSE 'pending' END AS state,
+                occurred_at, CASE WHEN last_error IS NULL THEN NULL ELSE 'UPLOAD_FAILED' END AS error_code
+         FROM incidents_queue WHERE event_id = ? AND synced = 0
+         ORDER BY occurred_at ASC LIMIT ?`,
+        [eventId, safeLimit]
+      ),
+      this.database.getAllAsync(
+        `SELECT client_record_id AS record_id,
+                CASE WHEN quarantined = 1 THEN 'quarantined'
+                     WHEN terminal_failure = 1 THEN 'terminal'
+                     WHEN attempt_count > 0 THEN 'retrying' ELSE 'pending' END AS state,
+                occurred_at, CASE WHEN last_error IS NULL THEN NULL ELSE 'UPLOAD_FAILED' END AS error_code
+         FROM overrides_queue WHERE event_id = ? AND synced = 0
+         ORDER BY occurred_at ASC LIMIT ?`,
+        [eventId, safeLimit]
+      ),
+    ]) as any[][];
+    const normalize = (kind: QueueDiagnostic['kind'], rows: any[]): QueueDiagnostic[] => rows.map((row) => ({
+      kind,
+      recordId: String(row.record_id || 'unknown').slice(0, 100),
+      state: row.state as QueueDiagnostic['state'],
+      occurredAt: String(row.occurred_at),
+      errorCode: row.error_code == null ? null : String(row.error_code).slice(0, 64),
+    }));
+    return [
+      ...normalize('scan', scans),
+      ...normalize('incident', incidents),
+      ...normalize('override', overrides),
+    ].sort((left, right) => left.occurredAt.localeCompare(right.occurredAt)).slice(0, safeLimit);
+  }
+
+  async quarantineEventQueues(eventId: number, reason: string): Promise<void> {
+    if (!this.database) throw new Error('Database not initialized');
+    const boundedReason = reason.slice(0, MAX_QUEUE_ERROR_LENGTH);
+    await this.database.executeBatchAsync([
+      [
+        `UPDATE scan_logs SET upload_state = 'quarantined', terminal_reason = ?
+         WHERE event_id = ? AND synced = 0 AND upload_state != 'acknowledged'`,
+        [boundedReason, eventId],
+      ],
+      [
+        `UPDATE incidents_queue SET quarantined = 1, quarantine_reason = ?
+         WHERE event_id = ? AND synced = 0`,
+        [boundedReason, eventId],
+      ],
+      [
+        `UPDATE overrides_queue SET quarantined = 1, quarantine_reason = ?
+         WHERE event_id = ? AND synced = 0`,
+        [boundedReason, eventId],
+      ],
+    ]);
+  }
+
   async getUnsyncedScanLogs(limit = 25, eventId?: number): Promise<(ScanLog & { id: number })[]> {
     if (!this.database) {
       throw new Error('Database not initialized');
@@ -1363,33 +1506,7 @@ class DatabaseServiceClass {
   }
 
   async quarantineEventScanLogs(eventId: number, reason: string): Promise<void> {
-    if (!this.database) throw new Error('Database not initialized');
-    const boundedReason = reason.slice(0, MAX_QUEUE_ERROR_LENGTH);
-    await this.database.executeBatchAsync([
-      [
-        `UPDATE scan_logs
-         SET upload_state = 'quarantined',
-             next_attempt_at = NULL,
-             terminal_reason = ?,
-             last_error_code = 'AUDIT_WINDOW_UNAVAILABLE',
-             last_error = ?
-         WHERE event_id = ? AND synced = 0
-           AND upload_state IN ('pending', 'retryable')`,
-        [boundedReason, boundedReason, eventId],
-      ],
-      [
-        `UPDATE incidents_queue
-         SET terminal_failure = 1, last_error = ?
-         WHERE event_id = ? AND synced = 0 AND terminal_failure = 0`,
-        [boundedReason, eventId],
-      ],
-      [
-        `UPDATE overrides_queue
-         SET terminal_failure = 1, last_error = ?
-         WHERE event_id = ? AND synced = 0 AND terminal_failure = 0`,
-        [boundedReason, eventId],
-      ],
-    ]);
+    await this.quarantineEventQueues(eventId, reason);
   }
 
   async queueIncident(eventId: number, category: string, description: string, area?: string, areaId?: number): Promise<void> {
@@ -1408,7 +1525,7 @@ class DatabaseServiceClass {
   async getUnsyncedIncidents(limit: number): Promise<QueuedIncident[]> {
     if (!this.database) throw new Error('Database not initialized');
     const rows = (await this.database.getAllAsync(
-      'SELECT * FROM incidents_queue WHERE synced = 0 AND terminal_failure = 0 ORDER BY id ASC LIMIT ?',
+      'SELECT * FROM incidents_queue WHERE synced = 0 AND terminal_failure = 0 AND quarantined = 0 ORDER BY id ASC LIMIT ?',
       [limit]
     )) as any[];
     return rows.map((row) => ({ ...row, terminal_failure: row.terminal_failure === 1 }));
@@ -1418,7 +1535,7 @@ class DatabaseServiceClass {
     if (!this.database) throw new Error('Database not initialized');
     const rows = (await this.database.getAllAsync(
       `SELECT * FROM incidents_queue
-       WHERE event_id = ? AND synced = 0 AND terminal_failure = 0 AND occurred_at <= ?
+       WHERE event_id = ? AND synced = 0 AND terminal_failure = 0 AND quarantined = 0 AND occurred_at <= ?
        ORDER BY id ASC LIMIT ?`,
       [eventId, cutoff, limit]
     )) as any[];
@@ -1430,7 +1547,8 @@ class DatabaseServiceClass {
     const placeholders = ids.map(() => '?').join(',');
     await this.database.runAsync(
       `UPDATE incidents_queue
-       SET synced = 1, last_error = NULL, terminal_failure = 0
+       SET synced = 1, last_error = NULL, terminal_failure = 0,
+           quarantined = 0, quarantine_reason = NULL
        WHERE id IN (${placeholders})`,
       ids
     );
@@ -1463,7 +1581,7 @@ class DatabaseServiceClass {
   async getUnsyncedOverrides(limit: number): Promise<QueuedOverride[]> {
     if (!this.database) throw new Error('Database not initialized');
     const rows = (await this.database.getAllAsync(
-      'SELECT * FROM overrides_queue WHERE synced = 0 AND terminal_failure = 0 ORDER BY id ASC LIMIT ?',
+      'SELECT * FROM overrides_queue WHERE synced = 0 AND terminal_failure = 0 AND quarantined = 0 ORDER BY id ASC LIMIT ?',
       [limit]
     )) as any[];
     return rows.map((row) => ({
@@ -1477,7 +1595,7 @@ class DatabaseServiceClass {
     if (!this.database) throw new Error('Database not initialized');
     const rows = (await this.database.getAllAsync(
       `SELECT * FROM overrides_queue
-       WHERE event_id = ? AND synced = 0 AND terminal_failure = 0 AND occurred_at <= ?
+       WHERE event_id = ? AND synced = 0 AND terminal_failure = 0 AND quarantined = 0 AND occurred_at <= ?
        ORDER BY id ASC LIMIT ?`,
       [eventId, cutoff, limit]
     )) as any[];
@@ -1493,7 +1611,8 @@ class DatabaseServiceClass {
     const placeholders = ids.map(() => '?').join(',');
     await this.database.runAsync(
       `UPDATE overrides_queue
-       SET synced = 1, last_error = NULL, terminal_failure = 0
+       SET synced = 1, last_error = NULL, terminal_failure = 0,
+           quarantined = 0, quarantine_reason = NULL
        WHERE id IN (${placeholders})`,
       ids
     );

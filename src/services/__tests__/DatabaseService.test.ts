@@ -141,6 +141,25 @@ describe('DatabaseService event-scoped users', () => {
     );
   });
 
+  it('aggregates event-scoped health across scan, incident, and override queues', async () => {
+    const database = createDatabaseDouble();
+    database.getFirstAsync
+      .mockResolvedValueOnce({ pending: 2, retrying: 1, terminal: 1, quarantined: 1, acknowledged: 4 })
+      .mockResolvedValueOnce({ pending: 3, retrying: 2, terminal: 1, quarantined: 0, acknowledged: 5 })
+      .mockResolvedValueOnce({ pending: 1, retrying: 1, terminal: 2, quarantined: 1, acknowledged: 6 });
+    service.database = database;
+
+    await expect(DatabaseService.getQueueHealth(7)).resolves.toEqual({
+      pending: 6,
+      retrying: 4,
+      terminal: 4,
+      quarantined: 2,
+      acknowledged: 15,
+      unresolved: 16,
+    });
+    expect(database.getFirstAsync.mock.calls.every(([, params]) => params?.[0] === 7)).toBe(true);
+  });
+
   it('does not record a successful checksum when an atomic snapshot replacement fails', async () => {
     const database = createDatabaseDouble();
     database.executeBatchAsync.mockRejectedValueOnce(new Error('write failed'));

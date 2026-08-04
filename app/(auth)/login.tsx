@@ -52,7 +52,18 @@ export default function LoginScreen() {
         }
 
         const notice = await DeviceControlService.consumeNotice();
-        if (notice) Alert.alert('Device registration changed', notice.message);
+        if (notice) {
+          Alert.alert(
+            'Device registration changed',
+            notice.message,
+            notice.reason === 'deregistered'
+              ? [
+                  { text: 'View audit queue', onPress: () => router.push('/(main)/queue-status') },
+                  { text: 'OK' },
+                ]
+              : [{ text: 'OK' }]
+          );
+        }
 
         console.log('✅ Loaded scanner data from encrypted database:', {
           scannerCount: users.length,

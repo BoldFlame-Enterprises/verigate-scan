@@ -6,7 +6,7 @@ import {
 } from './ApiClient';
 import { OfflineSessionService } from './OfflineSessionService';
 import { SyncScheduler } from './SyncScheduler';
-import { SyncService } from './SyncService';
+import { DeregistrationAuditService } from './DeregistrationAuditService';
 
 const DEVICE_NOTICE_KEY = 'verigate_scan_device_control_notice';
 const DEVICE_CONTROL_STATE_KEY = 'verigate_scan_device_control_state';
@@ -42,16 +42,19 @@ class DeviceControlServiceClass {
         const eventId = ApiClient.getDeviceEventId();
         if (!eventId) throw new Error('Deregistered device event binding is unavailable');
         const credential = await ApiClient.obtainAuditCredential();
-        await SyncService.drainDeregisteredAuditQueues({
+        const auditSession = {
           eventId,
           cutoff: credential.state_changed_at,
           deadline: credential.expires_at,
           accessToken: credential.accessToken,
-        });
+        };
+        await DeregistrationAuditService.begin(auditSession);
+        await DeregistrationAuditService.resume();
       } catch {
         // Unacknowledged audit rows remain inspectable for later support.
       }
     } else {
+      await DeregistrationAuditService.cancelForBlacklist();
       await ApiClient.clearAuditCredential();
     }
     await Promise.allSettled([

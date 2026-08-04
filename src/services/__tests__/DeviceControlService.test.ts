@@ -40,12 +40,20 @@ jest.mock('../SyncScheduler', () => ({
 jest.mock('../SyncService', () => ({
   SyncService: { drainDeregisteredAuditQueues: jest.fn(async () => ({ uploaded: 3 })) },
 }));
+jest.mock('../DeregistrationAuditService', () => ({
+  DeregistrationAuditService: {
+    begin: jest.fn(async () => undefined),
+    resume: jest.fn(async () => ({ status: 'completed', uploaded: 3, unresolved: 0 })),
+    cancelForBlacklist: jest.fn(async () => undefined),
+  },
+}));
 
 import { ApiClient, ApiError } from '../ApiClient';
 import { DeviceControlService } from '../DeviceControlService';
 import { OfflineSessionService } from '../OfflineSessionService';
 import { SyncScheduler } from '../SyncScheduler';
 import { SyncService } from '../SyncService';
+import { DeregistrationAuditService } from '../DeregistrationAuditService';
 
 describe('Scan connected device enforcement', () => {
   beforeEach(() => {
@@ -69,12 +77,13 @@ describe('Scan connected device enforcement', () => {
 
     expect(result).toEqual({ status: 'revoked', reason: 'deregistered' });
     expect(SyncScheduler.stop).toHaveBeenCalled();
-    expect(SyncService.drainDeregisteredAuditQueues).toHaveBeenCalledWith({
+    expect(DeregistrationAuditService.begin).toHaveBeenCalledWith({
       eventId: 4,
       cutoff: '2026-07-27T12:00:00.000Z',
       deadline: '2026-07-27T12:15:00.000Z',
       accessToken: 'audit-token',
     });
+    expect(DeregistrationAuditService.resume).toHaveBeenCalled();
     expect(OfflineSessionService.clear).toHaveBeenCalled();
     expect(ApiClient.clearTokens).toHaveBeenCalled();
     expect(listener).toHaveBeenCalledWith('deregistered');
@@ -90,6 +99,7 @@ describe('Scan connected device enforcement', () => {
 
     expect(ApiClient.obtainAuditCredential).not.toHaveBeenCalled();
     expect(SyncService.drainDeregisteredAuditQueues).not.toHaveBeenCalled();
+    expect(DeregistrationAuditService.cancelForBlacklist).toHaveBeenCalled();
     expect(ApiClient.clearAuditCredential).toHaveBeenCalled();
     expect(await DeviceControlService.consumeNotice()).toMatchObject({
       reason: 'blacklisted',

@@ -10,6 +10,7 @@ import React, {
 } from 'react';
 import { ApiClient } from '@/services/ApiClient';
 import { DatabaseService } from '@/services/DatabaseService';
+import { DeregistrationAuditService } from '@/services/DeregistrationAuditService';
 
 const MAX_INITIALIZATION_ATTEMPTS = 3;
 
@@ -80,6 +81,10 @@ export function AppInitializationProvider({ children }: { children: ReactNode })
       DatabaseService.initDatabase(),
       ApiClient.loadTokens(),
     ]).then(() => {
+      void DeregistrationAuditService.resume({
+        maximumPasses: 4,
+        foregroundBudgetMs: 1_500,
+      }).catch(() => undefined);
       dispatch({ type: 'success' });
     }).catch((error: unknown) => {
       dispatch({

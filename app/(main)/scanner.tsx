@@ -588,6 +588,13 @@ export default function ScannerScreen() {
             <Text style={styles.actionButtonText}>Logout</Text>
           </TouchableOpacity>
 
+          <TouchableOpacity
+            style={[styles.actionButton, styles.logsButton, styles.fullWidthButton]}
+            onPress={() => router.push('/(main)/queue-status')}
+          >
+            <Text style={styles.actionButtonText}>Audit queue health</Text>
+          </TouchableOpacity>
+
           <View style={styles.instructionsCard}>
             <Text style={styles.instructionsTitle}>Instructions:</Text>
             <Text style={styles.instructionText}>• Hold device steady and point camera at QR code</Text>

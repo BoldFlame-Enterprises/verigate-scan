@@ -20,9 +20,14 @@ The mobile app scanners/staff use to verify attendee QR codes offline against a 
 - **Area selection**: pick which area you're stationed at (from the areas synced for the event) before scanning.
 - **Visual + audio feedback**: distinct green/red overlays plus a bright short "granted" tone and a lower sustained "denied" buzz (`expo-av`), tuned to be audible/visible in noisy, low-light entrances; the scan screen runs a dark theme throughout.
 - **Manual entry fallback**: verify an attendee by email when their QR is damaged or unreadable.
-- **Emergency / manual override**: security/admin-role scanners can grant or deny access outside the normal QR flow with a mandatory logged reason, synced to the backend and reviewable on the dashboard.
+- **Emergency / manual override**: the current installation owner can record a
+  bounded, idempotent override request with a mandatory reason; the backend
+  persists it for event-scoped review rather than treating the client as final
+  administrative authority.
 - **Incident reporting**: flag suspicious activity or technical issues from the scan screen; synced to the backend's incident queue.
-- **Multi-user, role-aware UI**: multiple scanner accounts can log in/out on one device (quick-login list); security/admin roles see an extra "Emergency Override" action volunteers don't.
+- **One-owner installation model**: a Scan installation belongs to one operator.
+  Logout ends the session but does not transfer ownership; reassignment uses an
+  explicit reprovisioning flow and is blocked while unresolved audit work exists.
 - **Foreground event sync**: account authority selects and persists the event
   before device-session exchange. Later synchronization uses only the signed
   registration event and does not call account-only `/events`. Complete QR
@@ -63,7 +68,14 @@ This is an **Expo (SDK 53) app**, not a bare React Native CLI project, and it us
 
 ## 🔒 Local database encryption
 
-Same mechanism as the pass app: the local database is a real SQLCipher-encrypted file (`@op-engineering/op-sqlite`), enabled via a `"op-sqlite": { "sqlcipher": true }` key in `package.json` (op-sqlite has no Expo config plugin - this is read directly by its own build scripts), keyed by a random 256-bit value generated on first run and held only in the platform secure keystore via `expo-secure-store`. Every app start verifies a SHA-256 checksum of the database contents; on corruption or tampering the database is genuinely deleted and recreated with a fresh key rather than reopening the same broken file. Synced event data is purged automatically once an event ends (plus a 24h grace period).
+The local database is a SQLCipher-encrypted file (`@op-engineering/op-sqlite`),
+enabled by the `"op-sqlite": { "sqlcipher": true }` build setting and keyed by
+a random 256-bit value stored through `expo-secure-store`. Startup requires the
+native SQLCipher capability and runs SQLite `quick_check`. A failed check enters
+an explicit recovery surface; the app does not automatically delete unresolved
+audit evidence. Retention is event-aware: cached identity data is bounded,
+acknowledged and terminal queue rows have separate windows, and ended-event data
+is removed only after its grace period when unresolved work no longer requires it.
 
 Because `op-sqlite` is a native module, **this app cannot run in Expo Go** - it requires a custom dev client or a full prebuild:
 
@@ -75,7 +87,11 @@ npx expo run:android     # or: npx expo run:ios
 
 ## ⚙️ Configuration
 
-Set `EXPO_PUBLIC_API_URL` (or `expo.extra.apiBaseUrl` in `app.json`) to your backend's `/api` URL.
+For local development, set `EXPO_PUBLIC_API_URL` to the backend `/api` URL.
+Preview and production EAS profiles require an HTTPS, non-loopback `/api` URL,
+disable demo mode, and resolve the same public authority for Android and iOS.
+Profiled web releases are intentionally rejected. Scan uses local notifications
+only and does not require a remote push-provider client configuration.
 
 ## 📦 Scripts
 
@@ -90,7 +106,14 @@ Private local EAS/signing/provider files such as `credentials.json`, `*.jks`, `*
 
 ## Validation boundary
 
-Repository release evidence covers signed Android cloud build/publication for an exact source revision. It does not prove installation, physical camera/biometric/SQLCipher behavior, offline recovery after process kill, two-device replay handling, or any iOS behavior. Scan intentionally implements only local sync-stale notifications; logout cancels the session-local warning before authentication state is cleared.
+Repository tests validate deterministic release configuration, ownership and
+startup routing, authorization, queue recovery, retention, and critical rendered
+states. They do not prove a current Android/iOS build, installation, native
+SQLCipher linkage, physical camera/audio/accessibility behavior, offline recovery
+after process kill, two-device replay handling, fleet performance, or hosted
+end-to-end behavior. Scan intentionally implements only local sync-stale
+notifications; logout cancels the session-local warning before authentication
+state is cleared.
 
 Strict v2 verification remains a compatibility path. Do not remove it until
 supported Scan adoption, synchronized trust freshness, Pass v3 adoption, the

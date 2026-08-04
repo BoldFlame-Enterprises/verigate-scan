@@ -21,6 +21,15 @@ export default function AuthLayout() {
           headerShown: true
         }} 
       />
+      <Stack.Screen
+        name="select-event"
+        options={{
+          title: 'Select Event',
+          headerShown: true,
+          headerBackVisible: false,
+          gestureEnabled: false,
+        }}
+      />
     </Stack>
   );
 }

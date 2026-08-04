@@ -1,5 +1,21 @@
 import React, { createContext, ReactNode, useContext, useState } from 'react';
 import { ScannerUser } from '@/services/DatabaseService';
+import { BackendUser } from '@/services/ApiClient';
+
+export interface EligibleEvent {
+  id: number;
+  name: string;
+  starts_at: string | null;
+  ends_at: string | null;
+  is_active: boolean;
+  role_in_event: string;
+}
+
+export interface PendingAccountLogin {
+  user: BackendUser;
+  events: EligibleEvent[];
+  rememberMe: boolean;
+}
 
 interface ScannerContextType {
   scannerUser: ScannerUser | null;
@@ -12,6 +28,8 @@ interface ScannerContextType {
   setLastScanResult: (result: ScanResult | null) => void;
   selectedArea: string | null;
   setSelectedArea: (area: string | null) => void;
+  pendingAccountLogin: PendingAccountLogin | null;
+  setPendingAccountLogin: (login: PendingAccountLogin | null) => void;
 }
 
 export interface ScanResult {
@@ -33,6 +51,7 @@ export const ScannerProvider: React.FC<ScannerProviderProps> = ({ children }) =>
   const [scanCount, setScanCount] = useState<number>(0);
   const [lastScanResult, setLastScanResult] = useState<ScanResult | null>(null);
   const [selectedArea, setSelectedArea] = useState<string | null>(null);
+  const [pendingAccountLogin, setPendingAccountLogin] = useState<PendingAccountLogin | null>(null);
 
   return (
     <ScannerContext.Provider
@@ -46,7 +65,9 @@ export const ScannerProvider: React.FC<ScannerProviderProps> = ({ children }) =>
         lastScanResult,
         setLastScanResult,
         selectedArea,
-        setSelectedArea
+        setSelectedArea,
+        pendingAccountLogin,
+        setPendingAccountLogin,
       }}
     >
       {children}

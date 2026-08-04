@@ -32,7 +32,7 @@ export default function LoginScreen() {
     usersByAccessLevel: Record<string, number>;
     scannersByRole: Record<string, number>;
   } | null>(null);
-  const { setScannerUser } = useScanner();
+  const { setScannerUser, setPendingAccountLogin } = useScanner();
 
   useEffect(() => {
     // Load demo users and stats dynamically from encrypted database
@@ -51,7 +51,6 @@ export default function LoginScreen() {
           setRememberMe(true);
         }
 
-        await ApiClient.loadTokens();
         const notice = await DeviceControlService.consumeNotice();
         if (notice) Alert.alert('Device registration changed', notice.message);
 
@@ -91,33 +90,15 @@ export default function LoginScreen() {
           await ApiClient.clearTokens();
           throw new Error('This account is not authorized to use VeriGate Scan');
         }
-        const events = await ApiClient.request<{ id: number; name: string }[]>('/events');
+        const events = await ApiClient.request<import('@/context/ScannerContext').EligibleEvent[]>('/events');
         if (events.length === 0) {
           await ApiClient.clearTokens();
           throw new Error('No events assigned to this scanner account yet');
         }
-        const previousEventId = await SyncService.getCurrentEventId();
-        const selectedEvent = events.find((event) => event.id === previousEventId) ?? events[0];
-        await SyncService.selectEvent({
-          ...selectedEvent,
-          ends_at: (selectedEvent as { ends_at?: string | null }).ends_at ?? null,
-        });
-        const installationId = await SyncService.getDeviceId();
-        await ApiClient.registerDeviceSession(
-          selectedEvent.id,
-          installationId,
-          Platform.OS === 'ios' ? 'ios' : 'android'
-        );
-        await DeviceControlService.clearRevocationMarker();
-        const syncResult = await SyncService.syncNow();
-        if (!syncResult.success || !syncResult.eventId) {
-          await ApiClient.clearTokens();
-          throw new Error(syncResult.error ?? 'Initial event sync failed');
-        }
-        eventId = syncResult.eventId;
-        mode = 'production';
-        const areas = await DatabaseService.getSyncedAreas(eventId);
-        await DatabaseService.upsertSyncedScannerUser(backendUser, areas.map((area) => area.name));
+        setPendingAccountLogin({ user: backendUser, events, rememberMe });
+        setPassword('');
+        router.replace('/(auth)/select-event');
+        return;
       } else {
         await ApiClient.clearTokens();
       }

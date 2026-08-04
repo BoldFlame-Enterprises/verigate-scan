@@ -18,7 +18,12 @@ export default function IndexScreen() {
     const checkAuthState = async () => {
       try {
         const storedEmail = await DatabaseService.getStoredScannerEmail();
-        await ApiClient.loadTokens();
+        if (ApiClient.hasAccountSession()) {
+          // A process restart cannot reconstruct the in-memory account/event
+          // selection handoff safely. Require a fresh account login.
+          await ApiClient.clearTokens();
+          return;
+        }
         if (ApiClient.hasDeviceSession()) {
           const state = await DeviceControlService.checkConnectedState();
           if (state.status === 'revoked') return;

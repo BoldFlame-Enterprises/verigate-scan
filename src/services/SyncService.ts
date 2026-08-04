@@ -155,6 +155,15 @@ class SyncServiceClass {
     ]);
   }
 
+  async clearEventSelection(): Promise<void> {
+    await Promise.all([
+      SecureStore.deleteItemAsync(CURRENT_EVENT_ID_KEY),
+      SecureStore.deleteItemAsync(CURRENT_EVENT_NAME_KEY),
+      SecureStore.deleteItemAsync(CURRENT_EVENT_ENDS_AT_KEY),
+      SecureStore.deleteItemAsync(LAST_SYNC_AT_KEY),
+    ]);
+  }
+
   private async performSync(): Promise<SyncResult> {
     try {
       if (!ApiClient.isAuthenticated()) {

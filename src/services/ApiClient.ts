@@ -167,6 +167,10 @@ class ApiClientClass {
     return !!this.accessToken && this.sessionKind === 'device';
   }
 
+  hasAccountSession(): boolean {
+    return !!this.accessToken && this.sessionKind === 'account';
+  }
+
   private async setTokens(
     accessToken: string,
     refreshToken: string,

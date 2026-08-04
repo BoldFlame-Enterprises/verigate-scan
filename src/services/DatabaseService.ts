@@ -1800,6 +1800,18 @@ class DatabaseServiceClass {
     }
   }
 
+  async resetForReprovisioning(): Promise<void> {
+    this.database = null;
+    await SQLite.resetDatabase('verigate_scan.db');
+    await Promise.all([
+      SecureStore.deleteItemAsync('db_integrity_checksum'),
+      SecureStore.deleteItemAsync('scanner_seed_data_created'),
+      SecureStore.deleteItemAsync('scanner_remembered_email'),
+      SecureStore.deleteItemAsync('scanner_last_login'),
+      SecureStore.deleteItemAsync(DEVICE_CONTROL_STATE_KEY),
+    ]);
+  }
+
   private async assertRecordingAuthority(): Promise<void> {
     const revoked = await SecureStore.getItemAsync(DEVICE_CONTROL_STATE_KEY);
     if (revoked) {

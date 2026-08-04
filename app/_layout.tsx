@@ -1,41 +1,29 @@
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import React, { useEffect } from 'react';
+import React from 'react';
 import { ScannerProvider } from '@/context/ScannerContext';
-import { DatabaseService } from '@/services/DatabaseService';
+import { AppInitializationProvider } from '@/context/AppInitializationContext';
+import { InitializationBoundary } from '@/components/InitializationBoundary';
 
 export default function RootLayout() {
-  useEffect(() => {
-    const initializeApp = async () => {
-      try {
-        await DatabaseService.initDatabase();
-        console.log('✅ VeriGate Scan database initialized');
-      } catch (error) {
-        console.error('❌ Failed to initialize database:', error);
-      }
-    };
-
-    initializeApp();
-  }, []);
-
   return (
-    <ScannerProvider>
-      <Stack
-        screenOptions={{
-          headerStyle: {
-            backgroundColor: '#059669',
-          },
-          headerTintColor: '#fff',
-          headerTitleStyle: {
-            fontWeight: 'bold',
-          },
-        }}
-      >
-        <Stack.Screen name="index" options={{ headerShown: false }} />
-        <Stack.Screen name="(auth)" options={{ headerShown: false }} />
-        <Stack.Screen name="(main)" options={{ headerShown: false }} />
-      </Stack>
-      <StatusBar style="light" backgroundColor="#059669" />
-    </ScannerProvider>
+    <AppInitializationProvider>
+      <InitializationBoundary>
+        <ScannerProvider>
+          <Stack
+            screenOptions={{
+              headerStyle: { backgroundColor: '#059669' },
+              headerTintColor: '#fff',
+              headerTitleStyle: { fontWeight: 'bold' },
+            }}
+          >
+            <Stack.Screen name="index" options={{ headerShown: false }} />
+            <Stack.Screen name="(auth)" options={{ headerShown: false }} />
+            <Stack.Screen name="(main)" options={{ headerShown: false }} />
+          </Stack>
+          <StatusBar style="light" backgroundColor="#059669" />
+        </ScannerProvider>
+      </InitializationBoundary>
+    </AppInitializationProvider>
   );
 }

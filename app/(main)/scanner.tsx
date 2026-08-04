@@ -478,7 +478,7 @@ export default function ScannerScreen() {
             style={[styles.actionButton, styles.logoutButton]}
             onPress={handleLogout}
           >
-            <Text style={styles.actionButtonText}>Logout / Switch User</Text>
+            <Text style={styles.actionButtonText}>Logout</Text>
           </TouchableOpacity>
 
           <View style={styles.instructionsCard}>

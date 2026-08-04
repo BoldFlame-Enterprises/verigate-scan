@@ -140,9 +140,12 @@ describe('ApiClient token binding', () => {
       }) as never);
 
     await ApiClient.login('scanner@example.com', 'password');
+    expect(ApiClient.hasAccountSession()).toBe(true);
+    expect(ApiClient.hasDeviceSession()).toBe(false);
     const registration = await ApiClient.registerDeviceSession(7, 'scan-installation', 'android');
 
     expect(registration).toMatchObject({ id: 41, event_id: 7, app: 'scan' });
+    expect(ApiClient.hasAccountSession()).toBe(false);
     expect(ApiClient.hasDeviceSession()).toBe(true);
     expect(jest.mocked(global.fetch).mock.calls[1]).toEqual([
       'https://api.example.test/devices/session',

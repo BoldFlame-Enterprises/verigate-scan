@@ -56,6 +56,15 @@ export class DeviceIdentityServiceClass {
     await SecureStore.setItemAsync(INSTALLATION_ID_KEY, created);
     return created;
   }
+
+  async resetInstallationId(): Promise<void> {
+    this.installationId = null;
+    this.pendingIdentity = null;
+    await Promise.all([
+      SecureStore.deleteItemAsync(INSTALLATION_ID_KEY),
+      SecureStore.deleteItemAsync(LEGACY_FALLBACK_ID_KEY),
+    ]);
+  }
 }
 
 export const DeviceIdentityService = new DeviceIdentityServiceClass();

@@ -7,40 +7,64 @@
     "development": {
       "developmentClient": true,
       "distribution": "internal",
+      "environment": "development",
+      "env": {
+        "VERIGATE_BUILD_PROFILE": "development",
+        "EXPO_PUBLIC_API_URL": "https://verigate-api-flle.onrender.com/api",
+        "EXPO_PUBLIC_DEMO_MODE": "false"
+      },
       "android": {
         "buildType": "apk",
         "gradleCommand": ":app:assembleDebug",
         "withoutCredentials": false,
         "env": {
-          "GRADLE_OPTS": "-Xmx2048m -XX:MaxMetaspaceSize=512m",
-          "EXPO_PUBLIC_API_URL": "https://verigate-api-flle.onrender.com/api",
-          "EXPO_PUBLIC_DEMO_MODE": "false"
+          "VERIGATE_BUILD_PLATFORM": "android",
+          "GRADLE_OPTS": "-Xmx2048m -XX:MaxMetaspaceSize=512m"
         }
+      },
+      "ios": {
+        "env": { "VERIGATE_BUILD_PLATFORM": "ios" }
       }
     },
     "preview": {
       "distribution": "internal",
+      "environment": "preview",
+      "env": {
+        "VERIGATE_BUILD_PROFILE": "preview",
+        "EXPO_PUBLIC_API_URL": "https://verigate-api-flle.onrender.com/api",
+        "EXPO_PUBLIC_DEMO_MODE": "false"
+      },
       "android": {
         "buildType": "apk",
         "gradleCommand": ":app:assembleRelease",
         "withoutCredentials": false,
         "env": {
-          "GRADLE_OPTS": "-Xmx2048m -XX:MaxMetaspaceSize=512m",
-          "EXPO_PUBLIC_API_URL": "https://verigate-api-flle.onrender.com/api",
-          "EXPO_PUBLIC_DEMO_MODE": "false"
+          "VERIGATE_BUILD_PLATFORM": "android",
+          "GRADLE_OPTS": "-Xmx2048m -XX:MaxMetaspaceSize=512m"
         }
+      },
+      "ios": {
+        "env": { "VERIGATE_BUILD_PLATFORM": "ios" }
       }
     },
     "production": {
       "autoIncrement": true,
+      "environment": "production",
+      "env": {
+        "VERIGATE_BUILD_PROFILE": "production",
+        "EXPO_PUBLIC_API_URL": "https://verigate-api-flle.onrender.com/api",
+        "EXPO_PUBLIC_DEMO_MODE": "false"
+      },
       "android": {
         "buildType": "apk",
         "gradleCommand": ":app:assembleRelease",
         "env": {
-          "GRADLE_OPTS": "-Xmx2048m -XX:MaxMetaspaceSize=512m",
-          "EXPO_PUBLIC_API_URL": "https://verigate-api-flle.onrender.com/api",
-          "EXPO_PUBLIC_DEMO_MODE": "false"
+          "VERIGATE_BUILD_PLATFORM": "android",
+          "GRADLE_OPTS": "-Xmx2048m -XX:MaxMetaspaceSize=512m"
         }
+      },
+      "ios": {
+        "env": { "VERIGATE_BUILD_PLATFORM": "ios" }
       }
     }
   },
